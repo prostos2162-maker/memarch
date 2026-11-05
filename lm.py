@@ -16,7 +16,7 @@ planwimgK    — planwK + вихід через образи слів і пач�
 img_full     — те саме, але порівняння з усіма словами (щоб відділити «позичені образи»
                від «дешевого виходу»).
 
-Деталі реалізації прототипу карток (не з початкового задуму, переглянути):
+Рішення, які ухвалив Claude, а не Стефан (переглянути):
   - картки стоять у шарах card_layers, а не в кожному;
   - «книжка на полиці» = окремі вбудовування сирих токенів розміру d_book;
   - перечитування починається з самої закладки (зсув 0) і йде до max_read-1.
@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import dev
 from baseline import Block as AttnBlock
 
 
@@ -92,7 +93,7 @@ class CardRead(nn.Module):
 
     def forward(self, x, book):
         # усе в fp32: на torch 2.11 змішані bf16/fp32 тут ламають backward
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(dev.TYPE, enabled=False):
             return self._forward(x.float(), book.float())
 
     def _forward(self, x, book):
@@ -437,11 +438,120 @@ def _rope_at(x, pos, base=10000.0):
     inv = 1.0 / base ** (torch.arange(0, D, 2, device=x.device).float() / D)
     ang = pos.float()[:, None] * inv[None]
     cos, sin = ang.cos(), ang.sin()
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).flatten(-2).type_as(x)
+    from baseline import rope_cs
+    return rope_cs(x, cos, sin)
 
 
 _flex = None
+
+
+def _block_window_attention(q, k, v, window):
+    """Каузальне вікно (kv <= q, q - kv < window) без FlexAttention — для TPU/XLA: сталі форми.
+    Текст ріжеться на блоки по window; кожен блок дивиться на себе й на попередній блок (2·window ключів),
+    тож ціна лінійна, як у маски вікна. q, k, v: (B, H, T, hd)."""
+    B, H, T, D = q.shape
+    W = window
+    nb = -(-T // W)
+    pad = nb * W - T
+    if pad:                                                   # доповнені ключі стоять після всіх справжніх → маска їх відкидає
+        q, k, v = (F.pad(t, (0, 0, 0, pad)) for t in (q, k, v))
+    qb, kb, vb = (t.view(B, H, nb, W, D) for t in (q, k, v))
+    prev = lambda t: torch.cat([torch.zeros_like(t[:, :, :1]), t[:, :, :-1]], 2)
+    kk, vv = torch.cat([prev(kb), kb], 3), torch.cat([prev(vb), vb], 3)       # (B, H, nb, 2W, hd)
+    i = torch.arange(W, device=q.device)[:, None]
+    j = torch.arange(2 * W, device=q.device)[None]
+    ok = (j > i) & (j <= i + W)                                # ключ (n-1)·W + j для запиту n·W + i
+    first = torch.arange(nb, device=q.device)[:, None, None] > 0
+    mask = ok[None] & (first | (j >= W)[None])                 # у першому блоці попереднього немає
+    # SDPA — у 4 вимірах (TPU під compile не приймає 5-вимірний виклик): блоки склеюються з головами
+    qb, kk, vv = qb.reshape(B, H * nb, W, D), kk.reshape(B, H * nb, 2 * W, D), vv.reshape(B, H * nb, 2 * W, D)
+    mask = mask[None].expand(H, nb, W, 2 * W).reshape(1, H * nb, W, 2 * W)
+    out = F.scaled_dot_product_attention(qb, kk, vv, attn_mask=mask)
+    return out.reshape(B, H, nb * W, D)[:, :, :T]
+
+
+def _splash_window_attention(q, k, v, window):
+    """TPU: вікно через splash-увагу torch_tpu (Pallas, зі зворотним проходом) — без щільної маски на 2·вікно
+    ключів і без матеріалізації оцінок. (ATTN_IMPL=splash; збіг із маскою вікна перевіряється на TPU окремо.)"""
+    T = q.shape[2]
+    blk = int(os.environ.get("SPLASH_BLOCK", 512))
+    pad = (-T) % blk
+    if pad:
+        q, k, v = (F.pad(t, (0, 0, 0, pad)) for t in (q, k, v))
+    # входи — суцільні (B, H, T, hd): фейковий вихід splash копіює кроки q, тож і він буде суцільним, як справжній
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    # splash: «window_size попередніх ключів + сам» — наше вікно (q − kv < window) це window − 1 попередніх + сам
+    # SPLASH_KVC — внутрішній крок по ключах (block_kv_compute): на v6e MXU 256×256, тож 256 може бути кращим за 512
+    o = torch.tpu.ops.splash_sdpa(q, k, v, is_causal=True, local_window_size=window - 1,
+                                  block_q=blk, block_kv=blk, block_kv_compute=int(os.environ.get("SPLASH_KVC", blk)),
+                                  block_dkv=int(os.environ.get("SPLASH_DKV", blk)))
+    # фейкові кроки (strides) виходу splash під compile не збігаються зі справжніми → наступний reshape трасувався як
+    # view і падав в експорті; явна копія в суцільний формат дає однакову розкладку і в трасуванні, і насправді
+    o = o.clone(memory_format=torch.contiguous_format)
+    return o[:, :, :T] if pad else o
+
+
+class _CausalFlashLSE(torch.autograd.Function):
+    """Причинна Flash-увага, що повертає (вихід, logsumexp) і має ПОВНИЙ градієнт — і через logsumexp теж
+    (саме ядро його не дає). ∂lse_i/∂q_i = s·Σ_j P_ij k_j — це вихід тієї ж уваги зі значеннями = ключі;
+    ∂lse_i/∂k_j = s·P_ij q_i — це «градієнт значень» тієї ж уваги з dO_i = s·g_i·q_i."""
+
+    @staticmethod
+    def forward(ctx, q, k, v):
+        fa = torch.ops.aten._scaled_dot_product_flash_attention
+        o, lse, cq, ck, mq, mk, seed, off, _ = fa(q, k, v, 0.0, True)
+        ctx.save_for_backward(q, k, v, o, lse, cq, ck, seed, off)
+        ctx.mq, ctx.mk = mq, mk
+        return o, lse
+
+    @staticmethod
+    def backward(ctx, go, glse):
+        q, k, v, o, lse, cq, ck, seed, off = ctx.saved_tensors
+        fa = torch.ops.aten._scaled_dot_product_flash_attention
+        fab = torch.ops.aten._scaled_dot_product_flash_attention_backward
+        dq, dk, dv = fab(go.contiguous(), q, k, v, o, lse, cq, ck, ctx.mq, ctx.mk, 0.0, True, seed, off)
+        if glse is not None and os.environ.get("ATTN_LSE_GRAD", "1") == "1":   # 0 — лише для заміру ціни точного градієнта
+            sc = q.shape[-1] ** -0.5
+            g = (glse * sc).to(q.dtype)[..., None]                               # (B,H,L,1)
+            oX, lX, cq2, ck2, mq2, mk2, s2, o2, _ = fa(q, k, k, 0.0, True)        # значення = ключі
+            dq = dq + g * oX
+            dk = dk + fab((g * q).contiguous(), q, k, k, oX, lX, cq2, ck2, mq2, mk2, 0.0, True, s2, o2)[2]
+        return dq, dk, dv
+
+
+def _block_window_attention2(q, k, v, window):
+    """Те саме вікно (kv <= q, q - kv < window), але без щільної маски: два Flash-виклики на блок і злиття через
+    logsumexp. Блок n (W запитів): (A) свій блок — причинно; (B) попередній блок — ключ j видно запиту i лише якщо
+    j > i: після розвороту індексів у блоці це теж причинна маска (без діагоналі: запити зсунуті на 1).
+    Множень удвічі менше, ніж із маскою на 2W ключів, оцінки не матеріалізуються (Flash). GPU, bf16/fp16; інакше —
+    _block_window_attention. Градієнт точний (через logsumexp — _CausalFlashLSE)."""
+    B, H, T, D = q.shape
+    if not (q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)):
+        return _block_window_attention(q, k, v, window)
+    W = window
+    nb = -(-T // W)
+    pad = nb * W - T
+    if pad:
+        q, k, v = (F.pad(t, (0, 0, 0, pad)) for t in (q, k, v))
+    blk = lambda t: t.view(B, H, nb, W, D).permute(0, 2, 1, 3, 4).reshape(B * nb, H, W, D)
+    qb, kb, vb = blk(q), blk(k), blk(v)
+    oA, lA = _CausalFlashLSE.apply(qb, kb, vb)                              # (B·nb, H, W, D), lse (B·nb, H, W) fp32
+    # попередній блок: ключі блоку n-1 (у першому блоці — нулі, їх ховає lse = -inf нижче)
+    prev = lambda t: torch.cat([torch.zeros_like(t[:, :, :1]), t[:, :, :-1]], 2).permute(0, 2, 1, 3, 4).reshape(B * nb, H, W, D)
+    kp, vp = prev(k.view(B, H, nb, W, D)), prev(v.view(B, H, nb, W, D))
+    qr = qb.flip(2)[:, :, 1:].contiguous()                                   # запит i' = W-1-i, без i' = 0 (i = W-1: нічого з минулого)
+    kr, vr = kp.flip(2)[:, :, :-1].contiguous(), vp.flip(2)[:, :, :-1].contiguous()   # ключ j' = W-1-j; j > i  <=>  j' <= i'-1
+    oB, lB = _CausalFlashLSE.apply(qr, kr, vr)
+    oB = F.pad(oB, (0, 0, 1, 0)).flip(2)                                     # назад у порядок i
+    lB = F.pad(lB, (1, 0), value=float("-inf")).flip(2)
+    first = torch.zeros(B, nb, device=q.device, dtype=torch.bool)
+    first[:, 0] = True
+    lB = lB.masked_fill(first.reshape(B * nb, 1, 1), float("-inf"))
+    m = torch.maximum(lA, lB)
+    wA, wB = (lA - m).exp(), (lB - m).exp()
+    out = (oA.float() * wA[..., None] + oB.float() * wB[..., None]) / (wA + wB)[..., None]
+    out = out.to(q.dtype).view(B, nb, H, W, D).permute(0, 2, 1, 3, 4).reshape(B, H, nb * W, D)
+    return out[:, :, :T]
 
 
 def _flex_attention(q, k, v, block_mask):

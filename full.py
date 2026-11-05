@@ -21,9 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+import dev
 from baseline import Block as AttnBlock
 from baseline import rope
-from lm import ImageOut, TransformerLM, _flex_attention, _rope_at  # noqa: F401  (ImageOut — на майбутнє)
+from lm import ImageOut, TransformerLM, _block_window_attention, _block_window_attention2, _splash_window_attention, _flex_attention, _rope_at  # noqa: F401  (ImageOut — на майбутнє)
 
 
 _COMPILE = not os.environ.get("NO_COMPILE")
@@ -91,6 +92,22 @@ class FineMoE(nn.Module):
 
 
 _LMOE = os.environ.get("LIGHT_MOE")                              # "32:4" — легкі шари як MoE
+_LFFN = float(os.environ.get("LIGHT_FFN", 0) or 0)                 # ширина FFN легких шарів у d (0 — як було: 4d SwiGLU / 6d relu²)
+
+
+class _Relu2(torch.autograd.Function):
+    """relu(h)²: зберігається лише h (вперед пишеться один тензор), похідна 2·relu(h) — з h на зворотному."""
+
+    @staticmethod
+    def forward(ctx, h):
+        ctx.save_for_backward(h)
+        r = F.relu(h)
+        return r * r
+
+    @staticmethod
+    def backward(ctx, g):
+        h, = ctx.saved_tensors
+        return g * (2 * F.relu(h)).to(g.dtype)
 
 
 class FlexBlock(AttnBlock):
@@ -107,6 +124,14 @@ class FlexBlock(AttnBlock):
         if "x0" in _BLK:                      # сирі вбудовування слова до входу кожного шару
             self.x0_l = nn.Parameter(torch.zeros(()))
         self.cur_ve = self.cur_x0 = None
+        if "relu2" in _BLK or "relu2c" in _BLK:   # FFN relu(x·up)²·down, ширина 6d: параметрів і множень як у SwiGLU 4d,
+            self.up = nn.Linear(d, 6 * d, bias=False)       # без гейта (менше поелементного й байтів)
+            self.down = nn.Linear(6 * d, d, bias=False)
+        if _LFFN:                             # LIGHT_FFN=2 (Стефан, 02.11): легкі шари лише читають — FFN вужчий
+            hid = max(256, int(round(_LFFN * d / 256)) * 256)   # (думання — у важких шарах на якорях)
+            r2 = "relu2" in _BLK or "relu2c" in _BLK
+            self.up = nn.Linear(d, hid if r2 else 2 * hid, bias=False)
+            self.down = nn.Linear(hid, d, bias=False)
         if _LMOE:
             E, k = map(int, _LMOE.split(":"))
             self.moe = FineMoE(d, E, k)
@@ -116,7 +141,13 @@ class FlexBlock(AttnBlock):
         B, T, D = x.shape
         if self.cur_x0 is not None:
             x = x + self.x0_l * self.cur_x0
-        q, k, v = self.qkv(self.n1(x)).view(B, T, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)
+        if "qkv3" in _BLK:                   # три множення на зрізи тієї ж ваги: результат одразу в розкладці уваги
+            n1 = self.n1(x)
+            hd = D // self.heads
+            q, k, v = (F.linear(n1, self.qkv.weight[i * D:(i + 1) * D]).view(B, T, self.heads, hd).transpose(1, 2)
+                       for i in range(3))
+        else:
+            q, k, v = self.qkv(self.n1(x)).view(B, T, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)
         if self.cur_ve is not None:           # v: (B, heads, T, hd)
             g = 2 * torch.sigmoid(self.ve_gate(x)).transpose(1, 2)[..., None]
             v = v + g * self.cur_ve.view(B, T, self.heads, D // self.heads).transpose(1, 2)
@@ -129,7 +160,8 @@ class FlexBlock(AttnBlock):
                 q, k = rope(q), rope(k)
             else:
                 q, k = _rope_at(q, pos), _rope_at(k, pos)
-            a = _flex_attention(q, k, v, block_mask)
+            a = (({"block2": _block_window_attention2, "splash": _splash_window_attention}.get(block_mask[0], _block_window_attention))(q, k, v, block_mask[1])
+                 if isinstance(block_mask, tuple) else _flex_attention(q, k, v, block_mask))
         x = x + self.o(a.transpose(1, 2).reshape(B, T, D))
         if hasattr(self, "moe"):
             return x + self.moe(self.n2(x))
@@ -137,11 +169,17 @@ class FlexBlock(AttnBlock):
         if sel is not None:                   # «напівпрозорі» слова (розмовник певен) — без FFN; рахуємо лише непрозорі
             idx, ok = sel
             xs = self.n2(x).gather(1, idx[..., None].expand(-1, -1, D))
-            g, u = self.up(xs).chunk(2, -1)
-            y = self.down(F.silu(g) * u) * ok[..., None].to(x.dtype)
+            y = self.down(self._act(self.up(xs))) * ok[..., None].to(x.dtype)
             return x.scatter_add(1, idx[..., None].expand(-1, -1, D), y.type_as(x))
-        g, u = self.up(self.n2(x)).chunk(2, -1)
-        return x + self.down(F.silu(g) * u)
+        return x + self.down(self._act(self.up(self.n2(x))))
+
+    def _act(self, h):
+        if "relu2c" in _BLK:                  # свій backward (зберігає лише h) — на v6e виявився повільнішим
+            return _Relu2.apply(h)
+        if "relu2" in _BLK or "relu2c" in _BLK:
+            return F.relu(h).square()
+        g, u = h.chunk(2, -1)
+        return F.silu(g) * u
 
 
 class AnchorCardRead(nn.Module):
@@ -161,7 +199,7 @@ class AnchorCardRead(nn.Module):
         self.out = nn.Linear(d_book, d, bias=False)
 
     def forward(self, x, book, cards, idx, valid):
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(dev.TYPE, enabled=False):
             outs, costs = [], []
             for s in range(0, x.shape[1], self.chunk):
                 args = (x[:, s:s + self.chunk].float(), s, book.float(), cards.float(), idx, valid)

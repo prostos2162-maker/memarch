@@ -26,11 +26,21 @@
 Фокус: `focus` карток, яких торкались останніми; слово читає фокус і пам'ять,
 а навчений перемикач вирішує, скільки брати з фокуса.
 """
+import os as _os_ml
+MEM_LEAN = _os_ml.environ.get("MEM_LEAN", "1") == "1"   # див. Memory.write: зміст лише для вибраних слів
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _cumsum_last(m):
+    """Накопичена сума булевої маски по останньому виміру — множенням на трикутну матрицю (точно для лічильників;
+    на TPU cumsum стає reduce_window з доповненням, і компілятор XLA на ньому падає)."""
+    n = m.shape[-1]
+    tri = torch.ones(n, n, device=m.device, dtype=torch.float32).triu()
+    return (m.float() @ tri).round().long()
 
 
 def scale_grad(x, s):
@@ -73,7 +83,11 @@ class Memory(nn.Module):
         )
 
     def _contents(self, st):
-        """Зміст усіх карток у повному розмірі (тьмяні — розгорнуті зі стиснення)."""
+        """Зміст усіх карток у повному розмірі (тьмяні — розгорнуті зі стиснення). Для викликів ззовні:
+        під FSDP цей метод збирає ваги сам; усередині read/write — _contents_impl (без повторного збирання)."""
+        return self._contents_impl(st)
+
+    def _contents_impl(self, st):
         return torch.cat([st["fc"], self.up(st["dc"])], 1)
 
     def _score(self, st, now):
@@ -94,7 +108,7 @@ class Memory(nn.Module):
         sc = torch.cat([sc[..., :self.Fn], sc[..., self.Fn:] + dimw], -1)
         sc = sc.masked_fill(~st["valid"][:, None], -1e4)
         w = F.softmax(sc.float(), -1).type_as(h) * st["valid"].any(-1)[:, None, None]
-        vals = self.value(self.norm_c(scale_grad(self._contents(st), grad_scale)))  # (B,C,d)
+        vals = self.value(self.norm_c(scale_grad(self._contents_impl(st), grad_scale)))  # (B,C,d)
         mem = torch.einsum("bsc,bcd->bsd", w, vals)
 
         # фокус: картки, яких торкались останніми
@@ -116,7 +130,9 @@ class Memory(nn.Module):
         n = self.norm_w(h)
         f = self.face(n)                                                            # (B,S,f)
         imp = torch.sigmoid(self.importance(n))                                     # (B,S,1)
-        c = self.content(n) * imp                                                   # важливість іде через зміст
+        # MEM_LEAN=1: зміст рахується лише для вибраних слів (нижче, після вибору cand): вибір від змісту не залежить, а
+        # проєкція — порядкова, тож результат той самий, а роботи цієї проєкції у S/W разів менше (512 → 32)
+        c = None if MEM_LEAN else self.content(n) * imp
         st = dict(st)
         if w_read is not None:                                                      # облік: скільки разів діставали
             used = w_read.float().sum(1).detach()
@@ -137,10 +153,10 @@ class Memory(nn.Module):
             score = self._score(st, now)
             # нові → у свіжу: спершу порожні місця, потім найслабші свіжі (ті опускаються в тьмяну)
             key_f = torch.where(st["valid"][:, :Fn], score[:, :Fn], torch.full_like(score[:, :Fn], -2e9))
-            slot = key_f.argsort(-1).gather(1, (is_new.long().cumsum(-1) - 1).clamp(min=0))
+            slot = key_f.argsort(-1).gather(1, (_cumsum_last(is_new) - 1).clamp(min=0))
             demote = is_new & st["valid"][ar, slot]
             key_d = torch.where(st["valid"][:, Fn:], score[:, Fn:], torch.full_like(score[:, Fn:], -2e9))
-            dslot = key_d.argsort(-1).gather(1, (demote.long().cumsum(-1) - 1).clamp(min=0))  # індекс у тьмяній
+            dslot = key_d.argsort(-1).gather(1, (_cumsum_last(demote) - 1).clamp(min=0))  # індекс у тьмяній
             # підйом: тьмяну картку, яку цього шматка активно діставали, міняємо з найслабшою свіжою
             if w_read is not None:
                 heat = w_read.float().sum(1)[:, Fn:].masked_fill(~st["valid"][:, Fn:], 0)
@@ -151,8 +167,9 @@ class Memory(nn.Module):
                 promote = torch.zeros(B, dtype=torch.bool, device=h.device)
                 hot = weak = torch.zeros(B, dtype=torch.long, device=h.device)
 
-        fw, cw, pw, bw = f[ar, cand], c[ar, cand], positions[ar, cand], bright.gather(1, cand)
-        contents = self._contents(st)
+        fw, pw, bw = f[ar, cand], positions[ar, cand], bright.gather(1, cand)
+        cw = self.content(n[ar, cand]) * imp[ar, cand] if MEM_LEAN else c[ar, cand]  # важливість іде через зміст
+        contents = self._contents_impl(st)
         old = contents[ar, best]
         g = torch.sigmoid(self.gate(torch.cat([cw, old], -1)))
         new_val = old + g * (cw - old)                                              # уточнений образ

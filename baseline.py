@@ -4,12 +4,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ROPE_HALF=1: пари вимірів — половинки (x[:D/2], x[D/2:]), а не сусіди (0::2, 1::2): та сама RoPE з іншим
+# (однаковим для q і k) порядком вимірів, але без кроку 2 і stack — на TPU це суцільні зрізи замість копій
+ROPE_HALF = __import__("os").environ.get("ROPE_HALF", "1" if __import__("os").environ.get("DEVICE") in ("tpu", "xla")
+                                         else "") == "1"
+
+
+def rope_cs(x, cos, sin):
+    """Поворот x (..., D) кутами (cos, sin) форми (..., D/2), що мовчки розтягуються на x."""
+    if ROPE_HALF:
+        x1, x2 = x.chunk(2, -1)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).type_as(x)
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).flatten(-2).type_as(x)
+
+
 def rope(x, base=10000.0):
     # x: (B, H, T, D)
     T, D = x.shape[-2], x.shape[-1]
     inv = 1.0 / base ** (torch.arange(0, D, 2, device=x.device).float() / D)
     ang = torch.arange(T, device=x.device).float()[:, None] * inv[None]
     cos, sin = ang.cos(), ang.sin()
+    if ROPE_HALF:
+        return rope_cs(x, cos, sin)
     x1, x2 = x[..., 0::2], x[..., 1::2]
     out = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
     return out.flatten(-2).type_as(x)

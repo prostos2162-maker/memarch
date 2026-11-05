@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import dev
 from lm import build
 
 VOCAB = int(__import__('os').environ.get('VOCAB', 50304))  # gpt2 (50257), округлено вгору до кратного 64; словосполучення — 100288
@@ -64,7 +65,7 @@ def val_loss(model, val, batch, seq, n=20):
     total = 0.0
     for _ in range(n):
         xy = next(it)
-        with torch.autocast("cuda", torch.bfloat16):
+        with torch.autocast(dev.TYPE, torch.bfloat16):
             total += step_loss(model, xy, train=False)[0].item()
     model.train()
     return total / n
