@@ -74,15 +74,49 @@ memarch finishes earlier and leads for the first ~4 minutes, but its final loss 
 - **Custom kernels.** Triton kernels cover the fused output + cross-entropy step (including the pointer mixture), SwiGLU, and the optimizer step.
 - **Data pipeline.** About 300B tokens from permissively licensed sources: FineWeb-Edu, FineMath, The Stack v3 (permissive only), Nemotron-CC-Math, HPLT Ukrainian, FineWiki and others. The pipeline adds MinHash deduplication across all sources (6.97% of documents dropped), 13-gram benchmark decontamination (HumanEval, MBPP, GSM8K, MATH, MMLU, ARC, HellaSwag) and code-quality scoring. See `data/`.
 
+## TPU / JAX port
+
+`memarch_jax/` is a JAX port of the full training step (model, memory, MoE, optimizer) written for TPU v6e.
+It is a set of pure functions over a parameter pytree and runs on all chips of one host with `shard_map`:
+data parallelism for the light layers and memory, expert parallelism with all-to-all for the MoE layers, and
+Pallas kernels for the optimizer update. A CPU test suite checks it against the PyTorch reference in this
+repository (forward, loss, gradients and optimizer steps), including 8-device runs on emulated CPU devices.
+
+```bash
+cd memarch_jax
+export XLA_FLAGS=--xla_force_host_platform_device_count=8 PYTHONIOENCODING=utf-8
+python tests/test_dist_step.py                                           # 8-device training step on CPU
+python -m memarch_jax.bench_tpu --model small --seq 256 --steps 5 --cpu8   # benchmark smoke test
+```
+
+On a TPU v6e-8 VM, `python -m memarch_jax.bench_tpu --model Fv2moeK40h14d2560 --batch 1 --seq 8192 --remat heavy`
+reports step time, tokens/s, MFU and peak HBM. Installation, flags and environment variables are described in
+[`memarch_jax/docs/README_TPU.md`](memarch_jax/docs/README_TPU.md). The PyTorch code also runs on TPU through
+`DEVICE=tpu` / `DEVICE=xla` (`dev.py`).
+
+## Instinct optimizer
+
+Instinct (`exp_opt.InstinctOptB`, JAX version in `memarch_jax/memarch_jax/instinct.py`) is the project's own
+optimizer. It keeps a single momentum state per weight, scales the step by prediction surprise, and applies a
+"homeostasis" normalisation that balances each neuron's input and output updates. Weights can be kept in bf16
+with stochastic rounding; on TPU the update is a fused Pallas kernel.
+
+## Uroboros
+
+Uroboros (`memarch_jax/memarch_jax/hoop.py`, flags `--hoop` / `--hoop_budget`) is a new experimental component
+under development; details will be published after validation.
+
 ## Layout
 
 | path | contents |
 |---|---|
 | `full2.py`, `full.py`, `mem2.py` | the model: anchors, light/heavy layers, MoE banks, memory |
-| `exp_opt.py` | the instinct optimizer |
-| `fused_ops.py` | Triton kernels |
+| `exp_opt.py` | the Instinct optimizer |
+| `fused_ops.py`, `int8mm.py` | Triton kernels; optional int8 matrix multiplication (`INT8_MM=1`) |
 | `fastloop.py` | training loop (`speed` / `train`) |
+| `dev.py` | device selection (`DEVICE=cuda\|cpu\|tpu\|xla`) |
 | `lm.py` | transformer baseline |
+| `memarch_jax/` | JAX/TPU port: package, tests, `docs/README_TPU.md` |
 | `tools/phr/` | phrasebook, phrase tables, lock trust, per-token diagnostics |
 | `data/` | tokenization, dedup, decontamination, code scoring, source licenses |
 | `tok/` | Qwen3.6 tokenizer pruned to 131k |
@@ -93,7 +127,7 @@ Code comments are in Ukrainian.
 
 ## Status and next steps
 
-The architecture and data are ready for a main training run (~12B total / ~2B active, distilled from Qwen3.6-35B-A3B, target: a coding LLM with strong Ukrainian). The next steps are a TPU port, an AdamW 1B baseline, multiple seeds, downstream benchmarks, and long-context tests of the memory system.
+The architecture and data are ready for a main training run (~12B total / ~2B active, distilled from Qwen3.6-35B-A3B, target: a coding LLM with strong Ukrainian). The JAX/TPU port is in place and is being tuned for multi-chip throughput. The next steps are an AdamW 1B baseline, multiple seeds, downstream benchmarks, and long-context tests of the memory system.
 
 ## License
 
