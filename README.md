@@ -94,6 +94,9 @@ reports step time, tokens/s, MFU and peak HBM. Installation, flags and environme
 [`memarch_jax/docs/README_TPU.md`](memarch_jax/docs/README_TPU.md). The PyTorch code also runs on TPU through
 `DEVICE=tpu` / `DEVICE=xla` (`dev.py`).
 
+Measured throughput (Nov 6, 2026): the full ~12B model trains at **507k tokens/s on 8× TPU v6e**
+(517 ms per step, 4×8192 tokens per chip, memory, experts and the Instinct optimizer on).
+
 ## Instinct optimizer
 
 Instinct (`exp_opt.InstinctOptB`, JAX version in `memarch_jax/memarch_jax/instinct.py`) is the project's own
@@ -127,7 +130,7 @@ Code comments are in Ukrainian.
 
 ## Status and next steps
 
-The architecture and data are ready for a main training run (~12B total / ~2B active, distilled from Qwen3.6-35B-A3B, target: a coding LLM with strong Ukrainian). The JAX/TPU port is in place and is being tuned for multi-chip throughput. The next steps are an AdamW 1B baseline, multiple seeds, downstream benchmarks, and long-context tests of the memory system.
+The architecture and data are ready for a main training run (~12B total / ~2B active, distilled from Qwen3.6-35B-A3B, target: a coding LLM with strong Ukrainian). The JAX/TPU port is in place and reaches the 500k tokens/s throughput target on 8 TPU v6e chips. The next steps are an AdamW 1B baseline, multiple seeds, downstream benchmarks, and long-context tests of the memory system.
 
 ## License
 
