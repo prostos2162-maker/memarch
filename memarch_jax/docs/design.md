@@ -14,7 +14,7 @@
 3. **Pallas-ядра оптимізатора беремо напряму:** `pallas_hs1.instinct_hs1_2d/3d`, `pallas_instinct.instinct_vocab`. Вони вже є pure-JAX. Аліаси вмикаємо назад, `PALLAS_NO_ALIAS` не ставимо, плюс `donate_argnums`.
 4. **Режим «точна копія torch» (bit-faithful) іде за замовчуванням.** Режим із виправленими особливостями (`FIX_*` прапори) додаємо як варіанти після того, як паритет доведено.
 
-## 1. Структура пакета `D:\ai\memarch_jax\`
+## 1. Структура пакета `memarch_jax/`
 
 ```
 memarch_jax/
@@ -278,7 +278,7 @@ def _local(params, opt, tau, xy, prep, lr3):
 
 ## 5. Дані
 
-`data.py` імпортує `fastloop.CorpusData` / `GPUData` (numpy) з `sys.path=D:\ai\memarch`. Для кожного rank r використовуємо seed 1+r або `CorpusData(r, 8, CORPUS_SEED)`, як у torch. Отримані 8 масивів складаємо в `(8,B,T+1)` і передаємо через `jax.make_array_from_process_local_data` з `P('x')`.
+`data.py` імпортує `fastloop.CorpusData` / `GPUData` (numpy) з `sys.path=the repo root`. Для кожного rank r використовуємо seed 1+r або `CorpusData(r, 8, CORPUS_SEED)`, як у torch. Отримані 8 масивів складаємо в `(8,B,T+1)` і передаємо через `jax.make_array_from_process_local_data` з `P('x')`.
 
 `induct_raw` рахуємо тут у numpy (CPU_PREP), поки XLA виконує попередній крок. Префетч робимо в треді.
 
@@ -357,7 +357,7 @@ def _local(params, opt, tau, xy, prep, lr3):
 12. **Великий батч на чіп** змінює per-chip ємність MoE і кількість якорів на крок. Чи це прийнятне «та сама математика»? Формули ті самі, тільки N більше.
 13. **Параметри без grad** (окрім lock_w/ind_a, наприклад деякі параметри reread при REREAD_SEP): списка `p.grad is None` ще немає. Отримаємо його з одного torch-кроку і зафіксуємо як статичну маску. Згоден?
 
-Нічого не змінено, файлів не створено. Основні джерела: D:\ai\memarch\full2.py, D:\ai\memarch\mem2.py, D:\ai\memarch\exp_opt.py, D:\ai\memarch\pallas_hs1.py, D:\ai\memarch\pallas_instinct.py, D:\ai\memarch\fastloop.py, D:\ai\memarch_fable\hyperop\step.py, D:\ai\memarch_fable\hyperop\shard.py, D:\ai\memarch_fable\hyperop\mempass.py. Новий пакет: D:\ai\memarch_jax\ (ще не створений).
+Нічого не змінено, файлів не створено. Основні джерела: full2.py, mem2.py, exp_opt.py, pallas_hs1.py, pallas_instinct.py, fastloop.py, hyperop/step.py, hyperop/shard.py, hyperop/mempass.py. Новий пакет: memarch_jax/ (ще не створений).
 ## 10. Рішення Стефана (05.11)
 - Старт ваг: з нуля в JAX (новий seed, той самий розподіл init). Для тестів еквівалентності — конвертер ваг torch→JAX на малих моделях.
 - Великий батч на чіп (4–8×8192): ємність MoE і якорі рахуються від фактичного N тими ж формулами — прийнятно.
