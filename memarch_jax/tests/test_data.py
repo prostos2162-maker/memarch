@@ -1,6 +1,6 @@
-r"""M11-дані: data.Corpus на крихітних локальних шматках — збіг з torch-лоадером (data/loader.py)
+r"""M11-дані: data.Corpus на крихітних локальних шматках — збіг з torch-лоадером (D:\ai\memarch\data\loader.py)
 батч у батч, маски drop/cdrop/score, resume зі state_dict (Corpus і HostLoader з префетчем + induct prep).
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_data.py"""
+Запуск: cd D:\ai\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_data.py"""
 import json
 import os
 import sys
@@ -42,7 +42,7 @@ W = {"web": 0.4, "code": 0.6}
 
 def test_matches_torch_loader():
     import importlib.util
-    spec = importlib.util.spec_from_file_location("torch_loader", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "loader.py"))
+    spec = importlib.util.spec_from_file_location("torch_loader", r"D:\ai\memarch\data\loader.py")
     L = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(L)
     ref = L.Corpus(W, root=ROOT, seq=64, seed=3)

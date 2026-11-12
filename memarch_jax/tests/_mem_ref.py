@@ -15,7 +15,7 @@ os.environ.setdefault("REREAD_ANCH", "0.25")
 os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_allow_excess_precision=false").strip()
 for k in ("MEM_BF16", "BF16_ALL", "RR_BISECT", "NO_MEM", "NO_REREAD"):
     os.environ.pop(k, None)
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))  # repo root: torch reference code
+sys.path.insert(0, r"D:\ai\memarch")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np

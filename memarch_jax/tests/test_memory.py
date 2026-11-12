@@ -1,5 +1,5 @@
 """M5: паритет пам'яті (memory_pass = mempass-цикл над mem2.Memory) з torch на CPU, W=1.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_memory.py   (або pytest)"""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_memory.py   (або pytest)"""
 import _mem_ref as R  # noqa: E402  (ставить env/sys.path)
 from _mem_ref import torch, jnp, jax, np, diff, tn, j2n, t2j, stable_torch
 

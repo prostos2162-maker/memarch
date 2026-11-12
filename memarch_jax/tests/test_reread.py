@@ -1,6 +1,6 @@
 """M6: паритет перечитування (_reread_sep + Reread, REREAD_ANCH=0.25, REREAD_IDS, REC_LEAN) з torch на CPU, W=1;
 плюс комбінований тест пам'ять -> перечитування (градієнти крізь знімки в параметри пам'яті).
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_reread.py   (або pytest)"""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_reread.py   (або pytest)"""
 import _mem_ref as R  # noqa: E402
 from _mem_ref import torch, jnp, jax, np, diff, tn, j2n, t2j, stable_torch
 

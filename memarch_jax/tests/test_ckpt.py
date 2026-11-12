@@ -1,7 +1,7 @@
 """M11: ckpt — побітовий round-trip (params bf16/f32, стан Instinct з m bf16, cs, keys, used bool, tau, step,
 data_state) для бекендів npz і orbax; продовження тренування з відновленого стану дає побітово той самий крок;
 torch↔jax (export_torch → import_torch) побітово.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_ckpt.py"""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_ckpt.py"""
 import os
 import sys
 import tempfile

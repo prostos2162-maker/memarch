@@ -1,10 +1,10 @@
 """M0+M1: паритет FlexBlock (relu2, qkv3, LIGHT_FFN=2, ROPE_HALF, ATTN_IMPL=block) torch ↔ JAX на CPU, W=1.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_light.py   (або python -m pytest ...)"""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_light.py   (або python -m pytest ...)"""
 import os
 import sys
 
 os.environ.update(DEVICE="cpu", NO_COMPILE="1", ATTN_IMPL="block", ROPE_HALF="1", BLK="relu2,qkv3", LIGHT_FFN="2")
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))  # repo root: torch reference code
+sys.path.insert(0, r"D:\ai\memarch")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jax  # noqa: E402
@@ -95,9 +95,6 @@ def test_window_attn_f32():
 
 
 def test_consts():
-    if not (os.path.exists(config.DEFAULT_COUNTS) and os.path.exists(config.DEFAULT_LOCK_TRUST)):
-        print("SKIP test_consts: phrasebook files not found (set MEMARCH_PHR)")
-        return
     cfg = config.target()
     c = config.load_consts(cfg)
     cnt = config.load_counts(cfg.V)

@@ -97,12 +97,50 @@ def state_tree(state):
     return {k: state[k] for k in ("params", "opt", "tau", "step") if k in state}
 
 
+def state_bytes(state):
+    """Байти масивної частини стану (кожен листок один раз: репліковані не множаться на число чипів)."""
+    return sum(int(np.prod(x.shape)) * x.dtype.itemsize for x in jax.tree_util.tree_leaves(state_tree(state)))
+
+
+def snapshot(state):
+    """Копія стану в пам'яті хоста; після виходу state можна донатити в наступний крок.
+    На CPU device_get може повернути вигляд на той самий буфер, тому там — явна копія."""
+    tree = state_tree(state)
+    host = jax.device_get(tree)
+    on_cpu = all(d.platform == "cpu" for x in jax.tree_util.tree_leaves(tree) for d in x.devices())
+    return jax.tree_util.tree_map(np.array, host) if on_cpu else host
+
+
+def snapshot_pinned(state):
+    """CKPT_PINNED=1: копія стану в pinned-host пам'ять (DMA з усіх чипів паралельно, без numpy на хості).
+    Цикл чекає лише цю швидку копію; перетворення в numpy і запис — у фоні (host_tree_to_numpy).
+    Якщо memory kind не підтримується (CPU тощо) — None, і викликач падає на звичайний snapshot()."""
+    tree = state_tree(state)
+    try:
+        def put(x):
+            return jax.device_put(x, x.sharding.with_memory_kind("pinned_host"))
+        host = jax.tree_util.tree_map(put, tree)
+        jax.block_until_ready(host)
+        return host
+    except Exception:                                                    # noqa: BLE001
+        return None
+
+
+def host_tree_to_numpy(tree):
+    """Pinned-host масиви → numpy (у фоновому потоці; чипи не задіяні)."""
+    return jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)) if isinstance(x, jax.Array) else x, tree)
+
+
 def save(path, state, data_state=None, extra=None, backend="auto"):
     """state — dict з params/opt/tau/step (як step.init_state). data_state — JSON-серіалізований стан корпусу."""
+    return write(path, snapshot(state), data_state, extra, backend)
+
+
+def write(path, tree, data_state=None, extra=None, backend="auto"):
+    """Запис готового snapshot(...) у теку path, атомарно (можна з фонового потоку)."""
     ocp = _orbax()
     if backend == "auto":
         backend = "orbax" if ocp is not None else "npz"
-    tree = jax.device_get(state_tree(state))
     paths, vals = _flatten(tree)
     tmp = path.rstrip("/\\") + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)

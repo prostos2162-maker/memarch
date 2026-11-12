@@ -170,7 +170,7 @@ def short_consts(counts, V, K, rare_cap=0.3):
                 prior0=float(np.log(rare * K / (1 - rare))), rare_cap=rare_cap)
 
 
-def short_logp(h, W, y, sc, ch, vocab=None):
+def short_logp(h, W, y, sc, ch, vocab=None, prio=None):
     """log P(y) дворівневого виходу. h (N,d), W (V,d) голова, y (N,) int, sc — short_consts.
     Короткий словник (K+1 рядків, один шматок) + повний словник на C=місткість місцях (рідкісні — першими).
     vocab=None — один чіп; dist.VocabShard — W лише свої рядки (як shard.short_logp_vocab: короткі рядки — psum
@@ -188,6 +188,8 @@ def short_logp(h, W, y, sc, ch, vocab=None):
     rare = ys == K
     C = min(N, -(-int(round(sc["rare_cap"] * N)) // 256) * 256)
     key = rare.astype(F32) * 2 - jnp.arange(N, dtype=F32) / N
+    if prio is not None:   # нагадування: відповіді — першими в місткості рідкісних (інакше лише log P(кошика), без слова)
+        key = key + (rare & (prio.reshape(-1) > 0)).astype(F32) * 4
     idx = jax.lax.top_k(jax.lax.stop_gradient(key), C)[1]
     hit = rare[idx]
     vce = chunk_ce if vocab is None else vocab.ce

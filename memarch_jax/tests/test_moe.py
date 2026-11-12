@@ -1,6 +1,6 @@
 """M4: паритет memarch_jax.moe з torch BankMoE (MOE_DISP=onehot, MOE_K=4, MOE_ACT=relu2), W=1, CPU.
 
-Запуск:  cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_moe.py
+Запуск:  cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_moe.py
 (або python -m pytest tests/test_moe.py -q, якщо є pytest)
 """
 import os
@@ -9,7 +9,7 @@ import sys
 os.environ.update(DEVICE="cpu", NO_COMPILE="1", ATTN_IMPL="block", MOE_DISP="onehot", MOE_K="4",
                   MOE_ACT="relu2")
 os.environ.pop("BF16_ALL", None)
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))  # repo root: torch reference code
+sys.path.insert(0, r"D:\ai\memarch")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import numpy as np                                   # noqa: E402

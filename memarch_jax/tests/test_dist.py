@@ -6,7 +6,7 @@
     ситуація == справжнє середнє вектора слів по всьому батчу;
 (c) повний крок з Instinct (fp32, без SR) на однакових даних: нові ваги W=8 == W=1.
 Місткість MoE і якорі — на чип (від локального N), тож (b) збігається з окремими W=1 прогонами точно (див. decisions).
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_dist.py"""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_dist.py"""
 import os
 import sys
 

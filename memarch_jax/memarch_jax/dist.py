@@ -66,6 +66,10 @@ def param_specs(params):
         name = instinct.path_str(path)
         if name in ("heavy.up", "heavy.down"):                    # (L, E, ., .): вісь експертів
             return P(None, AXIS, None, None)
+        if name == "fish.up":                                     # (NF, d, HF): порізано по d, збирається all_gather
+            return P(None, AXIS, None)
+        if name == "fish.down":                                   # (NF, HF, d): порізано по HF (не по останній осі —
+            return P(None, AXIS, None)                            # масштаб рядка Instinct має форму (NF, HF, 1))
         return P()
     return jax.tree_util.tree_map_with_path(spec, params)
 
@@ -204,6 +208,13 @@ def make_dist(cfg, W, axis=AXIS):
                 quantile_hook=lambda q: lax.pmean(q, axis))
 
 
+def prep_keys(cfg):
+    """Ключі prep; cfg.remind додає маску відповідей нагадувань \"rem\" (B,T)."""
+    return (("cand", "on", "bk", "src") + (("rem",) if getattr(cfg, "remind", False) else ())
+            + (("hfull",) if getattr(cfg, "heavy_rotate", False) and not getattr(cfg, "heavy_all", False) else ())
+            + (("fish", "kind") if getattr(cfg, "fish_n", 0) > 0 else ()))
+
+
 def situation_local(emb_l, x, W, axis=AXIS):
     """Справжнє середнє вектора слів по батчу всіх чипів (§10): psum(своїх рядків своїх і чужих слів) / (W·B·T).
     emb_l (rows, d) свої рядки, x (B,T) свої слова. Кожне слово всіх чипів враховане рівно раз."""
@@ -230,7 +241,7 @@ def make_loss_fn(cfg, consts, mesh, params_like, remat=False):
         sit = situation_local(lax.stop_gradient(params["emb"]), xy[:, :-1], W)
         return total[None], tau_n, pm(terms), pm(stats), sit
 
-    prep_spec = {k: P(AXIS) for k in ("cand", "on", "bk", "src")}
+    prep_spec = {k: P(AXIS) for k in prep_keys(cfg)}
     sm = _shard_map(local, mesh=mesh, in_specs=(pspecs, P(AXIS), prep_spec, P()),
                     out_specs=(P(AXIS), P(), P(), P(), P()))
 
@@ -275,7 +286,8 @@ def offload_state_shardings(st_sh, kind="pinned_host"):
     return dict(st_sh, opt=opt)
 
 
-def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=True, tau=7.5, offload_opt=False):
+def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=True, tau=7.5, offload_opt=False,
+              alt_cfg=None):
     """step.make_train_step з loss_fn = shard_map(train_loss) цього модуля: fwd+bwd (shard_map, колективи
     всередині) + Instinct (поза shard_map, глобальні масиви) — одна jit-програма з donate стану.
     Розкладка стану фіксується in/out_shardings: вихідний state має ТІ САМІ шардування, що й вхідний, тож
@@ -291,7 +303,17 @@ def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=Tru
 
     ps = put(params, mesh, param_specs(params))
     rep = NamedSharding(mesh, P())
-    opt = jax.jit(lambda p: instinct.init(p, params["emb"].shape[1], icfg, spec))(ps)
+    # шардування стану ОДРАЗУ в jit (out_shardings): без цього XLA створював інерцію фішок/експертів цілою на кожному
+    # чипі (~22 ГБ на чип для фішок) і лише потім різав — на 32-ГБ v6e це впритул (12.11, tools/init_compile_check.py)
+    _by_shape0 = {}
+    for x in jax.tree_util.tree_leaves(ps):
+        _by_shape0.setdefault((x.shape, x.dtype), x.sharding)
+        _by_shape0.setdefault(x.shape, x.sharding)
+    _rep0 = NamedSharding(mesh, P())
+    _opt_shapes = jax.eval_shape(lambda p: instinct.init(p, params["emb"].shape[1], icfg, spec), ps)
+    _opt_sh = jax.tree_util.tree_map(
+        lambda s: _by_shape0.get((s.shape, s.dtype), _by_shape0.get(s.shape, _rep0)), _opt_shapes)
+    opt = jax.jit(lambda p: instinct.init(p, params["emb"].shape[1], icfg, spec), out_shardings=_opt_sh)(ps)
     # листки, що не залежать від params (скаляри, cs-сталі), jit кладе на ОДИН пристрій → реплікуємо на сітку
     opt = jax.tree_util.tree_map(
         lambda x: x if len(x.sharding.device_set) == mesh.size else jax.device_put(x, NamedSharding(mesh, P())), opt)
@@ -305,7 +327,7 @@ def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=Tru
         s = by_shape.get((x.shape, x.dtype), by_shape.get(x.shape))
         return jax.device_put(x, s) if s is not None and not x.sharding.is_equivalent_to(s, x.ndim) else x
     opt = jax.tree_util.tree_map(_fix, opt)
-    state = dict(params=ps, opt=opt, tau=jax.device_put(jnp.asarray(tau, F32), rep),
+    state = dict(params=ps, opt=opt, tau=jax.device_put(model.init_tau(cfg, tau), rep),
                  step=jax.device_put(jnp.zeros((), jnp.int32), rep))
     st_sh = jax.tree_util.tree_map(lambda x: x.sharding, state)
     off = None
@@ -314,7 +336,7 @@ def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=Tru
         st_sh = offload_state_shardings(st_sh)
         state = jax.device_put(state, st_sh)
     row = NamedSharding(mesh, P(AXIS))
-    b_sh = dict(xy=row, prep={k: row for k in ("cand", "on", "bk", "src")}, lr=rep)
+    b_sh = dict(xy=row, prep={k: row for k in prep_keys(cfg)}, lr=rep)
     lspec = {instinct.path_str(pth): sp for pth, sp in jax.tree_util.tree_flatten_with_path(
         param_specs(params), is_leaf=lambda v: isinstance(v, P))[0]}
     coll = S.Collectives(shard=(mesh, lspec))
@@ -324,4 +346,14 @@ def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=Tru
     def place_batch(b):
         return dict(xy=jax.device_put(b["xy"], row), prep={k: jax.device_put(v, row) for k, v in b["prep"].items()},
                     lr=jax.device_put(b["lr"], rep))
-    return ts, state, place_batch
+    if alt_cfg is None:
+        return ts, state, place_batch
+    # другий крок (інша втрата, ті самі форми й шардування стану) — напр. етап 1 нагадувань (remind_only)
+    lf2 = make_loss_fn(alt_cfg, consts, mesh, params, remat)
+
+    def loss_fn2(p, xy, prep, t):
+        loss, (tau_n, terms, stats, per, sit) = lf2(p, xy, prep, t)
+        return loss, (tau_n, terms, stats, {"situation": sit, "per_chip": per})
+    ts2 = S.make_train_step(alt_cfg, consts, spec, icfg, remat=remat, loss_fn=loss_fn2, donate=donate, coll=coll,
+                            in_shardings=(st_sh, b_sh), out_shardings=(st_sh, rep), offload=off)
+    return ts, state, place_batch, ts2

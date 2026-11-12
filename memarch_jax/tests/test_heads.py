@@ -1,5 +1,5 @@
 """Паритет M2+M3 (ce, surprise, short_logp, induct, anchors) проти torch full2.py на CPU, W=1.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_heads.py  (або python -m pytest)."""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_heads.py  (або python -m pytest)."""
 import os, sys, tempfile
 import numpy as np
 
@@ -13,7 +13,7 @@ os.environ.update(DEVICE="cpu", NO_COMPILE="1", ATTN_IMPL="block", CE_CHUNK=str(
                   SHORT_V=str(K), INDUCT="lock", INDUCT_IN="1", INDUCT_MIX="1", INDUCT_POS="1",
                   TOKEN_COUNTS=os.path.join(_tmp, "cnt.npy"))
 os.environ.pop("BF16_ALL", None)
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))  # repo root: torch reference code
+sys.path.insert(0, r"D:\ai\memarch")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import full2

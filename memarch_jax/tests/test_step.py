@@ -1,6 +1,6 @@
 """M10 (W=1): step.train_step — 5 jit-кроків на повтореному батчі зменшують loss; jit == eager (loss і grads);
 усі remat-політики дають ті самі loss/grads; jit-крок == ручний value_and_grad + instinct.step.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_step.py"""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_step.py"""
 import os
 import sys
 

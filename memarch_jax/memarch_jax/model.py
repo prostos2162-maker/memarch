@@ -14,9 +14,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from . import ce, induct, anchors, moe, memory, reread, hoop
+from . import ce, induct, anchors, moe, memory, reread, rope, uroboros, fishki
 from .attn import local_attention
-from .light import flex_block, init_block, post_attn, pre_attn
+from .light import flex_block, init_block, post_attn, pre_attn, pre_attn_rope
 from .prims import rmsnorm
 from .config import mix_w_init
 
@@ -36,9 +36,29 @@ def rr_cfg(cfg):
 
 def moe_cfg(cfg):
     # обруч: усі A=budget·T місць зайняті (top-k без порожніх) → fill = 1; місткість рахується від B·A
-    fill = 1.0 if getattr(cfg, "hoop", False) else cfg.frac / cfg.cap
+    fill = 1.0 if getattr(cfg, "uroboros", False) else cfg.frac / cfg.cap
     return moe.MoECfg(E=cfg.E, k=cfg.moe_k, group=cfg.moe_group, cap_align=cfg.cap_align, fill=fill,
                       fast=getattr(cfg, "moe_fast", True), a2a_chunks=getattr(cfg, "moe_a2a_chunks", 1))
+
+
+def rope_cfg(cfg):
+    return rope.RopeCfg(K=cfg.rope_k, links=cfg.rope_links, win=cfg.rope_win, span_cap=cfg.rope_span_cap,
+                        gather_cap=cfg.rope_gather_cap or None, route=cfg.rope_route, G=cfg.rope_hier_g,
+                        NB=cfg.rope_hier_nb, BM=cfg.rope_hier_bm, excl_win=cfg.rope_excl_win,
+                        route_rot=cfg.rope_route_rot, rgrad=cfg.rope_rgrad, chunk=cfg.rope_chunk,
+                        route_lazy=cfg.rope_route_lazy, dense_read=cfg.rope_dense_read, route_bf16=cfg.rope_route_bf16, pallas=cfg.rope_pallas,
+                        read=getattr(cfg, "rope_read", "v3"), mass_pos=bool(getattr(cfg, "remind", False)),
+                        mgrad=bool(getattr(cfg, "remind", False)) and getattr(cfg, "remind_use_w", 0.0) > 0)
+
+
+def init_tau(cfg, tau=7.5):
+    """Початковий стан порогів: скаляр (як було) або (2,) = [tau важких якорів, rope_tau] при cfg.rope;
+    (3,) = [.., rope_qtau] при cfg.rope_qfrac < 1 (поріг слів, що читають трос)."""
+    if not getattr(cfg, "rope", False):
+        return jnp.asarray(tau, F32)
+    if getattr(cfg, "rope_qfrac", 1.0) < 1.0:
+        return jnp.asarray([tau, cfg.rope_tau0, cfg.rope_qtau0], F32)
+    return jnp.asarray([tau, cfg.rope_tau0], F32)
 
 
 def moe_h2(cfg):
@@ -103,8 +123,15 @@ def init_params(key, cfg, lock_trust=None):
              memory=mem, reread=rr, l_norm=jnp.ones(d), l_head0=_lin(nk(), 128, d), l_head1=_lin(nk(), V, 128),
              heavy=heavy, norm=jnp.ones(d), head=head, ind_in_g=jnp.full((3,), -2.0, F32),
              mix_w=jnp.asarray(mix_w_init(lt)))
-    if getattr(cfg, "hoop", False):
-        p["hoop"] = hoop.init(nk(), d)
+    if getattr(cfg, "fish_n", 0) > 0:               # фішки замість важких MoE-шарів
+        del p["heavy"]
+        p["fish"] = fishki.init(nk(), cfg)
+        p["fish_router"] = jnp.zeros((d, cfg.fish_kinds), F32)
+    if getattr(cfg, "rope", False):                 # вагонетка замість mem2 і перечитування (book — лише для reread)
+        for name in ("memory", "reread", "book"):
+            del p[name]
+    if getattr(cfg, "uroboros", False):
+        p["hoop"] = uroboros.init(nk(), d)          # ключ параметрів лишається "hoop": сумісність зі старими ckpt
     return jax.tree_util.tree_map(lambda a: a.astype(cfg.cdt), p)
 
 
@@ -190,6 +217,20 @@ def _light(blk, h, cfg, r):
     return jax.checkpoint(flex_block, static_argnums=(2,), policy=None if r is True else r)(blk, h, cfg)
 
 
+def _light_rope(blk, h, cfg, r, rp, routed=None, qmask=None, docs=None):
+    """Легкий блок із вагонеткою. Увага завжди поза зовнішнім checkpoint: її шматки вже мають свій jax.checkpoint.
+    rp = (own, apos, avalid). → h, stats вагонетки."""
+    if r is False:
+        pre, post = pre_attn_rope, post_attn
+    else:
+        pol = r.policy if isinstance(r, LightSplit) else (None if r is True else r)
+        pre = jax.checkpoint(pre_attn_rope, static_argnums=(2,), policy=pol)
+        post = jax.checkpoint(post_attn, static_argnums=(3,), policy=pol)
+    qr, kr, qu, ku, v = pre(blk, h, cfg)
+    a, share, st = rope.rope_attention(qr, kr, qu, ku, v, *rp, rope_cfg(cfg), routed=routed, qmask=qmask, docs=docs)
+    return post(blk, h, a, cfg), dict(st, rope_share=share)
+
+
 # ---------------------------------------------------------------- forward
 
 def forward(params, consts, x, prep, tau, cfg, train=True, remat=False, dist=None):
@@ -202,6 +243,14 @@ def forward(params, consts, x, prep, tau, cfg, train=True, remat=False, dist=Non
     qhook = None if dist is None else dist.quantile_hook
     B, T = x.shape
     cdt = cfg.cdt
+    use_rope = getattr(cfg, "rope", False)
+    rope_tau_new = None
+    qf = getattr(cfg, "rope_qfrac", 1.0) if use_rope else 1.0
+    rope_qtau = rope_qtau_new = None
+    if use_rope:                                      # стан порогів (2,) або (3,): див. init_tau
+        if qf < 1.0:
+            rope_qtau = tau[2]
+        tau, rope_tau = tau[0], tau[1]
     r_light, r_heavy, r_mem = remat_parts(remat)
     stats = {}
     h = (p["emb"][x] if take is None else take(p["emb"], x)).astype(cdt)
@@ -216,43 +265,116 @@ def forward(params, consts, x, prep, tau, cfg, train=True, remat=False, dist=Non
     # --- легкі до пам'яті
     for blk in p["light_a"]:
         h = _light(blk, h, cfg, r_light)
-    h_a = h                                           # для голови обруча при hoop_at="light_a"
-    # --- пам'ять
-    reads, snaps, st, _ = memory.memory_pass(p["memory"], h, mem_cfg(cfg), remat=r_mem)
-    h = h + reads.astype(h.dtype)
-    stats["mem_cards"] = st["valid"].astype(F32).sum(1).mean()
-    for blk in p["light_b"]:
-        h = _light(blk, h, cfg, r_light)
+    h_a = h                                           # для голови обруча при uroboros_at="light_a"
+    # --- пам'ять: вагонетка (cfg.rope) замість mem2 і перечитування, інакше — як було
+    if use_rope:
+        # якорі — здивування легкої голови після light_a; порядок як у full2: спершу оновлення порогу, потім маска
+        sr = ce.surprise(rmsnorm(h, p["l_norm"]), p["l_head0"], p["l_head1"], x, cfg.ce_chunk, vocab)
+        rope_tau_new = rope_tau
+        if train:
+            q = jnp.quantile(sr[:, 1:].reshape(-1)[:100_000], 1 - cfg.frac)
+            q = q if qhook is None else qhook(q)
+            rope_tau_new = (rope_tau * 0.9 + 0.1 * q).astype(F32)
+        rp = rope.anchors_from_surprise(sr, rope_tau_new, max(1, round(T * cfg.cap)))
+        stats["rope_anchors"] = rp[2].astype(F32).sum(1).mean() / T
+        qmask = None
+        docs = None
+        if getattr(cfg, "rope_doc_eos", -1) >= 0:              # межа документа для троса (лише маска вибору якорів)
+            docs = jax.lax.stop_gradient(jnp.cumsum((x == cfg.rope_doc_eos).astype(jnp.int32), axis=1))
+        if qf < 1.0:
+            # ROPE_QFRAC (як full2, 10.11): трос читають лише слова зі здивуванням sr >= порога; решта — лише вікно.
+            # Поріг — EMA квантиля (1-qf) у навчанні, заморожений в оцінці (причинно, як rope_tau)
+            rope_qtau_new = rope_qtau
+            if train:
+                qq = jnp.quantile(sr[:, 1:].reshape(-1)[:100_000], 1 - qf)
+                qq = qq if qhook is None else qhook(qq)
+                rope_qtau_new = (rope_qtau * 0.9 + 0.1 * qq).astype(F32)
+            qmask = jax.lax.stop_gradient(sr >= rope_qtau_new)
+            stats["rope_qfrac_real"] = qmask.astype(F32).mean()
+        routed = None
+        mps = []
+        for bi, blk in enumerate(p["light_b"]):
+            if cfg.rope_layers and bi >= cfg.rope_layers:
+                h = _light(blk, h, cfg, r_light)
+                continue
+            h, st_r = _light_rope(blk, h, cfg, r_light, rp, routed, qmask, docs)
+            rt = st_r.pop("_route")
+            mp = st_r.pop("_mass_pos", None)
+            if mp is not None:                        # нагадування: частка троса по позиціях, середнє по шарах троса
+                mps.append(mp)
+            routed = rt if cfg.rope_share_route else None
+            if bi == 0:                               # як full2: rope_share першого шару
+                stats.update(st_r)
+        if mps:
+            stats["_rope_mass_pos"] = sum(mps) / len(mps)
+    else:
+        reads, snaps, st, _ = memory.memory_pass(p["memory"], h, mem_cfg(cfg), remat=r_mem)
+        h = h + reads.astype(h.dtype)
+        stats["mem_cards"] = st["valid"].astype(F32).sum(1).mean()
+        for blk in p["light_b"]:
+            h = _light(blk, h, cfg, r_light)
     lh = rmsnorm(h, p["l_norm"])
     # --- здивування → якорі
     s_ = ce.surprise(lh, p["l_head0"], p["l_head1"], x, cfg.ce_chunk, vocab)
-    if getattr(cfg, "hoop", False):
+    fish_on = getattr(cfg, "fish_n", 0) > 0
+    if fish_on:
+        # --- фішки (схема Стефана 11.11): увесь крок — один вид, текст іде через комбінацію фішок prep['fish'];
+        # якорі для важкої частини не потрібні (трос бере свої якорі в легких шарах)
+        r_ce, r_acc, r_logits = fishki.router_loss(p["fish_router"], lh, prep["kind"].reshape(-1))
+        fax = None if dist is None else dist.vocab.axis
+        if getattr(cfg, "fish_eval", False):
+            # готова модель: роутер вибирає вид КОЖНОГО рядка, рядок іде через увесь набір цього виду
+            kinds = r_logits.argmax(-1)
+            out = jnp.zeros_like(h)
+            for k, pool in enumerate(fishki.pools(cfg)):
+                hk = fishki.chain(p["fish"], h, jnp.asarray(pool, jnp.int32), fax, remat=r_heavy)
+                out = out + jnp.where((kinds == k)[:, None, None], hk, jnp.zeros_like(hk))
+            h = out
+        else:
+            order = prep["fish"].reshape(-1, prep["fish"].shape[-1])[0]
+            h = fishki.chain(p["fish"], h, order, fax, remat=r_heavy)
+        aux = 10.0 * r_ce                                  # у total іде 0.01·aux = 0.1·CE роутера
+        drop = jnp.zeros((), F32)
+        tau_new = tau
+        stats["fish_router_acc"] = r_acc
+    elif getattr(cfg, "uroboros", False):
         # --- обруч: модель сама передбачає свою помилку ДО важких шарів і віддає їм лише top-k «не з'їдених»
         # (локально на чипі, по кожній послідовності — у shard_map B локальне, комунікацій немає)
-        feat = lh if cfg.hoop_at == "light_b" else rmsnorm(h_a, p["l_norm"])
-        pred = hoop.predict(p["hoop"], feat, s_)
+        feat = lh if cfg.uroboros_at == "light_b" else rmsnorm(h_a, p["l_norm"])
+        pred = uroboros.predict(p["hoop"], feat, s_)
         Bq, Tq = pred.shape
-        if cfg.hoop_thr >= 0:      # каузально: поріг на кожне слово окремо, без ранжування по послідовності
+        if cfg.uroboros_thr >= 0:      # каузально: поріг на кожне слово окремо, без ранжування по послідовності
             idx = jnp.broadcast_to(jnp.arange(Tq)[None], (Bq, Tq))
-            valid = (pred > cfg.hoop_thr).at[:, 0].set(True)
+            valid = (pred > cfg.uroboros_thr).at[:, 0].set(True)
         else:
-            idx, valid = hoop.select(pred, cfg.hoop_budget)
+            idx, valid = uroboros.select(pred, cfg.uroboros_budget)
         tau_new = tau
         stats["anchors"] = jnp.mean(valid.astype(F32)) * idx.shape[1] / Tq
-        stats["_hoop_pred"], stats["_hoop_idx"] = pred, idx      # забирає loss_terms (не йдуть у pmean)
+        stats["_uroboros_pred"], stats["_uroboros_idx"] = pred, idx      # забирає loss_terms (не йдуть у pmean)
         s_heavy = pred
     else:
         idx, valid, tau_new, st_a = anchors.select_anchors(s_, tau, cfg.frac, cfg.cap, train, quantile_hook=qhook)
         stats.update(st_a)
         s_heavy = s_
     # --- важкі (MoE) на якорях
-    h, aux, drop = moe.heavy_stack(p["heavy"], h, idx, valid, s_heavy, moe_cfg(cfg), exchange, remat=r_heavy, stats=stats)
+    if fish_on:
+        pass
+    elif getattr(cfg, "heavy_all", False) or getattr(cfg, "heavy_rotate", False):
+        fi = None if getattr(cfg, "heavy_all", False) else prep["hfull"].reshape(-1)[0]
+        h, aux, drop = moe.heavy_stack_full(p["heavy"], h, idx, valid, s_heavy, moe_cfg(cfg), exchange, remat=r_heavy,
+                                            stats=stats, full_idx=fi, all_full=getattr(cfg, "heavy_all", False))
+    else:
+        h, aux, drop = moe.heavy_stack(p["heavy"], h, idx, valid, s_heavy, moe_cfg(cfg), exchange, remat=r_heavy, stats=stats)
     stats["moe_drop"] = drop
     for blk in p["final"]:
         h = _light(blk, h, cfg, r_light)
-    # --- перечитування
-    o, cost = reread.reread_sep(p["reread"], h, s_, x, p["book"], snaps, rr_cfg(cfg), take)
-    h = h + o.astype(h.dtype)
+    # --- перечитування (при вагонетці його немає: full2 no_mem → cost = 0)
+    if use_rope:
+        cost = jnp.zeros((), F32)
+        tau_new = jnp.stack([tau_new, rope_tau_new] + ([rope_qtau_new] if qf < 1.0 else []))
+    else:
+        o, cost = reread.reread_sep(p["reread"], h, s_, x, p["book"], snaps, rr_cfg(cfg), take)
+        h = h + o.astype(h.dtype)
     hn = rmsnorm(h, p["norm"])
     return (hn, lh), cost, aux, (c1, g), tau_new, stats
 
@@ -263,27 +385,57 @@ def loss_terms(params, consts, xy, prep, tau, cfg, train=True, remat=False, dist
     B, T = x.shape
     (hn, lh), cost, aux, (c1, g), tau_new, stats = forward(params, consts, x, prep, tau, cfg, train, remat, dist)
     vocab = None if dist is None else dist.vocab
+    _rp = prep.get("rem") if isinstance(prep, dict) else None
     logp, st_r = ce.short_logp(hn.reshape(B * T, -1), params["head"], y.reshape(-1), consts["sc"], cfg.ce_chunk,
-                               vocab)
+                               vocab, **({"prio": _rp} if _rp is not None else {}))
     stats.update(st_r)
     main = induct.mix_nll(logp.reshape(B, T), c1, g, y) / (B * T)
     hl = None
-    if "_hoop_pred" in stats:
-        pred, idx = stats.pop("_hoop_pred"), stats.pop("_hoop_idx")
+    if "_uroboros_pred" in stats:
+        pred, idx = stats.pop("_uroboros_pred"), stats.pop("_uroboros_idx")
         # справжня помилка моделі на кожному слові (та сама суміш, що в main), зупинена — ціль обруча
         py = jnp.exp(logp.reshape(B, T).astype(F32))
         pm = (1 - g).astype(F32) * py + g.astype(F32) * (c1 == y).astype(F32)
         nll_tok = jax.lax.stop_gradient(-jnp.log(jnp.maximum(pm, 1e-30)))
-        hl = hoop.loss(pred, nll_tok)
-        stats.update(hoop.stats(pred, nll_tok, idx, cfg.hoop_eat))
+        hl = uroboros.loss(pred, nll_tok)
+        stats.update(uroboros.stats(pred, nll_tok, idx, cfg.uroboros_eat))
+    rem = prep.get("rem") if isinstance(prep, dict) else None
+    rem_t = None
+    if rem is not None:                                                 # нагадування: лише відповіді голок
+        py_r = jnp.exp(logp.reshape(B, T).astype(F32))
+        pm_r = (1 - g).astype(F32) * py_r + g.astype(F32) * (c1 == y).astype(F32)
+        mk = rem.astype(F32)
+        den = float(B * cfg.remind_q)
+        rem_t = (-jnp.log(jnp.maximum(pm_r, 1e-30)) * mk).sum() / den
+        stats["remind_hit"] = ((pm_r > 0.5).astype(F32) * mk).sum() / den   # p(відповідь)>0.5 ⇒ argmax правильний
+        stats["remind_n"] = mk.sum() / den
+        stats["remind_nll"] = rem_t
+        if getattr(cfg, "remind_mean", False):                          # --remind_pack: середнє по відповідях (як torch CE)
+            rem_t = rem_t * (den / jnp.maximum(mk.sum(), 1.0))
+        mpos = stats.pop("_rope_mass_pos", None)
+        if mpos is not None:                                            # частка уваги троса саме на питаннях
+            use = (mpos.astype(F32) * mk).sum() / den                       # Σ mass на питаннях / (B·q)
+            stats["remind_rope_share"] = jax.lax.stop_gradient(use)
+            if cfg.remind_use_w > 0:                                    # штраф: mean(1 − mass) по питаннях
+                rem_use = (mk.sum() / den) - use
+                stats["remind_use_pen"] = jax.lax.stop_gradient(rem_use)
+    stats.pop("_rope_mass_pos", None)
     if not train:
         return dict(main=main), main, tau_new, stats
     light = ce.light_head_aux(lh, params["l_head0"], params["l_head1"], y, cfg.ce_chunk, vocab)
     terms = dict(main=main, aux=aux, light=light, cost=cost.astype(F32))
     total = main + 0.01 * aux + 0.3 * light + cfg.read_cost * cost.astype(F32)
+    if rem_t is not None:
+        terms["remind"] = rem_t
+        total = total + cfg.remind_w * rem_t
+        if getattr(cfg, "remind_only", False):                         # етап 1: як torch loss_and_pred — лише відповіді
+            total = total - main
+        if cfg.remind_use_w > 0 and "remind_use_pen" in stats:
+            terms["remind_use"] = rem_use
+            total = total + cfg.remind_use_w * rem_use
     if hl is not None:
-        terms["hoop"] = hl
-        total = total + cfg.hoop_w * hl
+        terms["uroboros"] = hl
+        total = total + cfg.uroboros_w * hl
     return terms, total, tau_new, stats
 
 

@@ -3,7 +3,7 @@
 Мала конфігурація: d=256, head_dim=64, E=8, heavy=2, light 1/1/1, window=64, seg=64, V=4096, SHORT_V=512, T=512.
 Прапори як у цілі: INDUCT=lock(+IN,+MIX,+POS), SURP_INGRAPH, CE_CHUNK, SHORT_V, MOE_DISP=onehot MOE_K=4 MOE_ACT=relu2,
 REREAD_SEP + REREAD_ANCH=0.25, ROPE_HALF, BLK=relu2,qkv3, LIGHT_FFN=2.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_model.py"""
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_model.py"""
 import copy
 import os
 import sys

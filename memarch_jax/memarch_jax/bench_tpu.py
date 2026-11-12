@@ -40,6 +40,7 @@ def _args(argv=None):
                    help="пік bf16 на чип, TFLOP/s (v6e = 918)")
     a.add_argument("--profile", default=None, help="тека для jax.profiler trace")
     a.add_argument("--profile_steps", type=int, default=3)
+    a.add_argument("--profile_at", type=int, default=None, help="крок початку trace (без прапора: одразу після --warmup)")
     a.add_argument("--chips", type=int, default=None, help="W (за замовчуванням усі пристрої)")
     a.add_argument("--cpu8", action="store_true", help="8 CPU-пристроїв (XLA_FLAGS) — smoke без TPU")
     a.add_argument("--moe_chunks", type=int, default=None, help="cfg.moe_a2a_chunks (шматки a2a для перекриття)")
@@ -49,8 +50,22 @@ def _args(argv=None):
     a.add_argument("--vocab_take_bwd", default=None, help="cfg.vocab_take_bwd: sort|scatter (бекворд take, A/B)")
     a.add_argument("--no_ce_a2a", action="store_true", help="cfg.vocab_ce_a2a=False (A/B)")
     a.add_argument("--rope_old", action="store_true", help="light.ROPE_BTHD=False (A/B)")
-    a.add_argument("--hoop", action="store_true", help="cfg.hoop=True: обруч замість якорів (важкі лише top budget·T)")
-    a.add_argument("--hoop_budget", type=float, default=0.125, help="cfg.hoop_budget (частка слів у важкі)")
+    a.add_argument("--rope_mem", action="store_true", help="cfg.rope=True: вагонетка замість mem2/reread (rope.py)")
+    a.add_argument("--rope_gather_cap", type=int, default=0, help="слів на запит у зібраній частині (0 = k·span_cap, точно)")
+    a.add_argument("--rope_route_lazy", action="store_true", help="cfg.rope_route_lazy: hier-пошук ланки лише для top-K (A/B)")
+    a.add_argument("--rope_route", default=None, help="cfg.rope_route: hier|exact")
+    a.add_argument("--rope_route_bf16", action="store_true", help="cfg.rope_route_bf16 (A/B)")
+    a.add_argument("--rope_layers", type=int, default=0, help="cfg.rope_layers: вагонетка лише в перших N шарах light_b (0 — усі)")
+    a.add_argument("--rope_share_route", action="store_true", help="cfg.rope_share_route: один пошук на всі шари (зміна семантики)")
+    a.add_argument("--rope_read", default=None, help="cfg.rope_read: v1 (старе ядро) | v3 (типове)")
+    a.add_argument("--rope_pallas", action="store_true", help="cfg.rope_pallas: Pallas-ядра вагонетки (потрібен --rope_route exact)")
+    a.add_argument("--rope_dense_read", action="store_true", help="cfg.rope_dense_read: читання без gather/scatter (A/B)")
+    a.add_argument("--anchor_frac", type=float, default=None,
+                   help="частка слів-якорів (cfg.frac: поріг-квантиль). Без прапора — як у config (frac 0.2, cap 0.25)")
+    a.add_argument("--anchor_cap", type=float, default=None,
+                   help="стеля якорів (cfg.cap, статична форма A=cap·T). Без прапора при --anchor_frac: cap = anchor_frac")
+    a.add_argument("--uroboros", "--hoop", dest="uroboros", action="store_true", help="cfg.uroboros=True: обруч замість якорів (важкі лише top budget·T)")
+    a.add_argument("--uroboros_budget", "--hoop_budget", dest="uroboros_budget", type=float, default=0.125, help="cfg.uroboros_budget (частка слів у важкі)")
     a.add_argument("--host_init", action="store_true", help="ініціалізація на хості (інакше jit з out_shardings)")
     return a.parse_args(argv)
 
@@ -79,8 +94,28 @@ def _cfg(args):
         kw["vocab_take_bwd"] = args.vocab_take_bwd
     if args.no_ce_a2a:
         kw["vocab_ce_a2a"] = False
-    if args.hoop:
-        kw["hoop"], kw["hoop_budget"] = True, args.hoop_budget
+    if args.uroboros:
+        kw["uroboros"], kw["uroboros_budget"] = True, args.uroboros_budget
+    if getattr(args, "anchor_frac", None) is not None or getattr(args, "anchor_cap", None) is not None:
+        fr = base.frac if args.anchor_frac is None else args.anchor_frac
+        cp = args.anchor_cap if args.anchor_cap is not None else (fr if args.anchor_frac is not None else base.cap)
+        assert 0 < fr <= cp <= 1, f"потрібно 0 < anchor_frac <= anchor_cap <= 1, маю {fr}, {cp}"
+        kw["frac"], kw["cap"] = fr, cp
+    if getattr(args, "rope_mem", False):
+        kw["rope"] = True
+        if getattr(args, "rope_gather_cap", 0):
+            kw["rope_gather_cap"] = args.rope_gather_cap
+        # getattr: train_tpu та інші викликачі можуть не мати частини прапорів (раніше — AttributeError на --rope_mem)
+        kw["rope_route_lazy"] = getattr(args, "rope_route_lazy", False)
+        kw["rope_dense_read"] = getattr(args, "rope_dense_read", False)
+        kw["rope_pallas"] = getattr(args, "rope_pallas", False)
+        if getattr(args, "rope_read", None):
+            kw["rope_read"] = args.rope_read
+        kw["rope_route_bf16"] = getattr(args, "rope_route_bf16", False)
+        kw["rope_layers"] = getattr(args, "rope_layers", 0)
+        kw["rope_share_route"] = getattr(args, "rope_share_route", False)
+        if getattr(args, "rope_route", None):
+            kw["rope_route"] = args.rope_route
     if args.rope_old:
         from . import light
         light.ROPE_BTHD = False
@@ -166,6 +201,8 @@ def main(argv=None):
     print(f"[bench] jax {jax.__version__} платформа {plat} W={W} пристрої {jax.devices()[0].device_kind}")
     print(f"[bench] cfg: d={cfg.d} E={cfg.E} heavy={cfg.heavy} V={cfg.V} B/чип={cfg.B} T={cfg.T} dtype={cfg.dtype} "
           f"attn={cfg.attn_impl} remat={args.remat}")
+    print(f"[bench] якорі: frac={cfg.frac} cap={cfg.cap} (A={max(1, round(cfg.T * cfg.cap))} із T={cfg.T}); rope={cfg.rope} "
+          f"gather_cap={cfg.rope_gather_cap or cfg.rope_k * cfg.rope_span_cap}")
     consts, _, lt = _consts(cfg, args)
     # частина кортежу: True/False або будь-яка назва policy (раніше невідомі назви мовчки ставали False)
     remat = tuple({"True": True, "False": False}.get(x, x)
@@ -228,9 +265,12 @@ def main(argv=None):
     # --- кроки
     tok = W * cfg.B * cfg.T
     times, losses, n_comp0 = [], [], len(compiles)
+    t_comp_all, n_comp_all = sum(compiles), len(compiles)
+    stat_log = []
+    prof_at = args.warmup if args.profile_at is None else args.profile_at
     prof_on = False
     for i in range(args.steps):
-        if args.profile and i == args.warmup and not prof_on:
+        if args.profile and i == prof_at and not prof_on:
             jax.profiler.start_trace(args.profile)
             prof_on = True
         t0 = time.perf_counter()
@@ -245,12 +285,19 @@ def main(argv=None):
         dt = time.perf_counter() - t0
         times.append(dt)
         losses.append(loss)
-        if prof_on and i == args.warmup + args.profile_steps - 1:
+        if prof_on and i == prof_at + args.profile_steps - 1:
             jax.profiler.stop_trace()
             prof_on = False
             print(f"[bench] trace → {args.profile}")
+        st = {k: float(np.mean(v)) for k, v in m["stats"].items()
+              if k in ("rope_share", "rope_anchors", "rope_overflow", "anchors", "moe_drop", "moe_fill")}
+        stat_log.append(st)
+        extra = "".join(f"  {k} {v:.5f}" for k, v in sorted(st.items()))
+        for lk in ("moe_drop_l", "moe_active_l"):
+            if lk in m["stats"]:
+                extra += f"  {lk} " + ",".join(f"{x:.2f}" for x in np.ravel(np.asarray(m["stats"][lk])))
         print(f"[bench] step {i:3d} {dt * 1e3:9.1f} ms  {tok / dt:12,.0f} tok/s  loss {loss:.4f}  "
-              f"tau {float(m['tau']):.4f}", flush=True)
+              f"tau {float(np.ravel(m['tau'])[0]):.4f}{extra}", flush=True)
     if prof_on:
         jax.profiler.stop_trace()
     recompiles = len(compiles) - n_comp0
@@ -268,11 +315,20 @@ def main(argv=None):
         print(f"[bench] пік HBM на чип: max {max(peaks) / 2**30:.2f} GiB, min {min(peaks) / 2**30:.2f} GiB, "
               f"ліміт {(hbm[0]['limit'] or 0) / 2**30:.2f} GiB")
     print(f"[bench] перекомпіляцій після кроку 1: {recompiles}")
+    print(f"[bench] компіляцій XLA до кроків: {n_comp_all}, сумарно {t_comp_all:.1f} с; після старту кроків: {recompiles}")
+    steady_st = stat_log[args.warmup:] or stat_log
+    stat_mean = {k: float(np.mean([s[k] for s in steady_st])) for k in (steady_st[0] if steady_st else {})}
+    stat_max = {k: float(np.max([s[k] for s in steady_st])) for k in stat_mean}
+    if stat_mean:
+        print("[bench] статистика (середнє по сталих кроках): " + ", ".join(f"{k}={v:.5f} (max {stat_max[k]:.5f})" for k, v in sorted(stat_mean.items())))
+    print(f"[bench] сталих кроків у медіані: {len(steady)}; p10/p90 {np.percentile(steady, 10) * 1e3:.1f}/{np.percentile(steady, 90) * 1e3:.1f} мс")
     res = dict(model=args.model, W=W, batch=cfg.B, seq=cfg.T, remat=args.remat, dtype=cfg.dtype, attn=cfg.attn_impl,
                params_B=n_par / 1e9, init_s=t_init, lower_s=t_lower, compile_s=t_comp, step_ms=med * 1e3,
                step_ms_all=[t * 1e3 for t in times], tok_s=tps, mfu=mfu, hbm_peak_GiB=[p / 2**30 for p in peaks],
                mem_analysis=mem, xla_flops_per_chip=xla_flops, recompiles=recompiles, losses=losses,
-               host_prep_ms=t_prep * 1e3, profile=args.profile)
+               host_prep_ms=t_prep * 1e3, profile=args.profile, frac=cfg.frac, cap=cfg.cap, rope=cfg.rope,
+               rope_gather_cap=cfg.rope_gather_cap, n_steady=len(steady), compiles=n_comp_all, compile_total_s=t_comp_all,
+               stats_mean=stat_mean, stats_max=stat_max, stats_all=stat_log)
     print("RESULT " + json.dumps(res))
     return res
 

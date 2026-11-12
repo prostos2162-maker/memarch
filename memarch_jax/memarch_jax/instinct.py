@@ -13,7 +13,7 @@
 
 Стохастичне округлення (SR) — лічильникове (хеш lowbias32 номера елемента й насіння кроку), як у Pallas-ядрах:
 детерміноване й відтворюване; cfg.sr=False — округлення до найближчого (для тестів проти torch з OPT_SR_OFF=1).
-Pallas-ядра (pallas_hs1 / pallas_instinct з the torch code root) — коли вага й інерція bf16 і SR увімкнено; на CPU —
+Pallas-ядра (pallas_hs1 / pallas_instinct з D:\\ai\\memarch) — коли вага й інерція bf16 і SR увімкнено; на CPU —
 interpret=True. Інакше — чистий jnp (та сама математика, у тому числі той самий хеш SR → побітово ті самі біти).
 """
 import dataclasses
@@ -25,12 +25,12 @@ import jax
 import jax.numpy as jnp
 
 EPS = 1e-8
-_TORCH_DIR = os.environ.get("MEMARCH_TORCH_DIR", os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))
+_TORCH_DIR = os.environ.get("MEMARCH_TORCH_DIR", r"D:\ai\memarch")
 
 
 def _kernels():
     """Ліниво імпортуємо Pallas-ядра Стефана (вони лежать поруч із torch-кодом, але самі — чистий JAX)."""
-    # копії лежать у пакеті (на TPU-VM немає torch-коду); оригінал — лише запасний шлях
+    # копії лежать у пакеті (на TPU-VM немає D:i\memarch); оригінал — лише запасний шлях
     try:
         from . import pallas_instinct, pallas_hs1
     except ImportError:
@@ -394,8 +394,10 @@ def update(params, grads, st, lr_t, lr_v, cfg, spec, axis_name=None, rows_total=
             rel = rel.at[i].set(jax.lax.cond(want_rel, rel_fn, lambda: rel[i].astype(jnp.float32)).astype(rel.dtype))
         else:                 # старий шлях: норми щокроку + where
             rel = rel.at[i].set(jnp.where(want_rel, rel_fn(), rel[i]))
+        # фішки (fish.*) порізані між чипами ВСЕРЕДИНІ матриці (по d / HF): гомеостаз ядра нормує рядки й стовпці
+        # лише свого шматка → не те саме, що глобально; чистий jnp-шлях (GSPMD) рахує норми по всій матриці — точно
         pallas_ok = (cfg.use_pallas and cfg.sr and p.dtype == jnp.bfloat16 and mi.dtype == jnp.bfloat16
-                     and kind in ("hs", "hs3", "vocab"))
+                     and kind in ("hs", "hs3", "vocab") and not str(leaf).startswith("fish."))
         if kind in ("hs", "hs3", "vocab") and cfg.sr and p.dtype == jnp.bfloat16 and mi.dtype == jnp.bfloat16:
             seed_t = seed_t + 1                              # лічильник крокує на кожну вагу «ядерного» шляху
             seed = _seed_bits(seed_t)
@@ -497,7 +499,37 @@ def step(params, grads, st, *, lr, situation, loss, spec, cfg, axis_name=None, r
     """(params, grads, opt_state, lr, situation, loss) → (params, opt_state): prepare → update → finish.
     lr — python float (рахується lr_at на хості, float64 → f32) або traced скаляр."""
     lr_t, lr_v, ratio = lr_scalars(lr, cfg)
+    p_old, m_old, cs_old = params, dict(st["m"]), dict(st["cs"])
     st = prepare(st, loss, situation, ratio, cfg)
     params, st = update(params, grads, st, lr_t, lr_v, cfg, spec, axis_name, rows_total, shard)
+    params, st = _freeze_idle(p_old, m_old, cs_old, params, grads, st)
     return params, finish(st, cfg)
+
+
+FREEZE_IDLE = ("fish.up", "fish.down", "fish.norm")       # стек (NF, ...): фішки, яких крок не торкався, не міняються
+
+
+def _freeze_idle(p_old, m_old, cs_old, params, grads, st):
+    """Фішки (Стефан 11.11): за крок працює лише 2 з NF. Фішка без градієнта цього кроку лишається як була —
+    ні згасання ваг (wd), ні руху за інерцією (як у torch AdamW, де невикористаний параметр має grad None).
+    Без цього за ~97% «простою» кожної фішки wd стер би її ваги за тренування."""
+    gf = {path_str(p): g for p, g in jax.tree_util.tree_flatten_with_path(grads)[0]}
+    if not any(n in gf for n in FREEZE_IDLE):
+        return params, st
+    act = {n: jnp.abs(gf[n].astype(jnp.float32)).reshape(gf[n].shape[0], -1).sum(1) > 0 for n in FREEZE_IDLE if n in gf}
+
+    def pick(n, new, old):
+        a = act[n].reshape((-1,) + (1,) * (new.ndim - 1))
+        return jnp.where(a, new, old.astype(new.dtype))
+    po = {path_str(p): x for p, x in jax.tree_util.tree_flatten_with_path(p_old)[0]}
+    params = jax.tree_util.tree_map_with_path(
+        lambda p, x: pick(path_str(p), x, po[path_str(p)]) if path_str(p) in act else x, params)
+    m, cs = dict(st["m"]), dict(st["cs"])
+    nf = {n: act[n].shape[0] for n in act}
+    for n in act:                     # лише стан, що йде ПО ФІШКАХ (перша вісь = NF); напр. cs fish.norm має форму (1, d)
+        if n in m and n in m_old and m[n].shape[:1] == (nf[n],):
+            m[n] = pick(n, m[n], m_old[n])
+        if n in cs and n in cs_old and cs[n].shape[:1] == (nf[n],) and cs[n].shape == cs_old[n].shape:
+            cs[n] = pick(n, cs[n], cs_old[n])
+    return params, dict(st, m=m, cs=cs)
 

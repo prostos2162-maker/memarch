@@ -1,7 +1,7 @@
 r"""M11: step.make_train_step на сітці з 8 CPU-чипів (dist.make_step) — fwd+bwd(shard_map)+Instinct в ОДНІЙ
 jit-програмі з donate і remat. 10 кроків на повтореному батчі: loss спадає, після кроку 1 жодних перекомпіляцій
 (лічильник backend_compile + _cache_size), розкладка стану зберігається, крок 1 == W=1 step.py на тих самих даних.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_dist_step.py"""
+Запуск: cd D:\ai\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_dist_step.py"""
 import os
 import sys
 

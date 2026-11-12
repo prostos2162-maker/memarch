@@ -2,7 +2,7 @@ r"""Review M9-M12: Pallas-ядра Instinct у 8-чиповому кроці (di
 не розбиває — шардовані листки (vocab-рядки, EP-експерти) йдуть через shard_map (instinct._pallas_call).
 Тут (CPU, interpret=True) перевіряємо: крок з ядрами == крок чистим jnp з точністю до шуму SR (насіння шматків
 змішане з номером чипа), розкладка стану збережена, ядерний шлях справді пройдено.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_dist_pallas.py"""
+Запуск: cd D:\ai\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_dist_pallas.py"""
 import os
 import sys
 

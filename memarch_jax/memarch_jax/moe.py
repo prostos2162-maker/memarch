@@ -84,6 +84,7 @@ class MoECfg:
     # up_mid: розкладка проміжку експерта: 'w' — (W,El,c,h) як зараз; 'e' — (El,W,c,h) (експерт-мажор, як старий
     # bmm, де up-матмул ішов на 84%); down повертає (W,El,c,d) для a2a. Ті самі добутки/згортки.
     up_mid: str = field(default_factory=lambda: os.environ.get("MOE_UP_MID", "w"))
+    layer_stats: bool = field(default_factory=lambda: os.environ.get("MOE_LAYER_STATS", "0") == "1")
 
 
 def capacity(N, cfg):
@@ -254,7 +255,8 @@ def bank_moe(p, x, sa, cfg, exchange=IDENTITY, with_fill=False):
     out = out.reshape(Np, d)[:N].astype(xf.dtype)
     res = (x + out.reshape(B, A, d), aux, dropped)
     if with_fill:
-        res = res + (lax.stop_gradient(place.sum().astype(jnp.float32) / float(E * Ct)),)
+        active = (place.any((0, 1, 2))).sum().astype(jnp.float32)         # експертів із хоч одним місцем (лог колапсу)
+        res = res + (lax.stop_gradient(place.sum().astype(jnp.float32) / float(E * Ct)), lax.stop_gradient(active))
     return res
 
 
@@ -287,6 +289,75 @@ def _moe_fast(p, xg, D, wtab, c, cfg, exchange, dtype):
 
 # ---------- стек важких шарів (без уваги: HEAVY_ATTN вимкнено) ----------
 
+def _full_cfg(cfg):
+    """MoECfg для шару «на всіх словах»: усі місця справжні → fill = 1 (місткість від B·T)."""
+    import dataclasses as _dc
+    return _dc.replace(cfg, fill=1.0)
+
+
+def heavy_stack_full(ps, h, idx, valid, s_, cfg, exchange=IDENTITY, remat=False, stats=None, full_idx=None,
+                     all_full=False):
+    """Важкі шари з «повним» шаром (ідея Стефана 11.11): шар на всіх словах замість лише якорів.
+    full_idx — скаляр int (дані кроку, без перекомпіляцій): шар з цим номером цього кроку працює на ВСІХ словах
+    (решта — на якорях); -1 — жоден. all_full=True (статично) — усі шари на всіх словах (фінальна фаза / готова модель).
+    Стан: hh (B,T,d) — справжній стан не-якорів; a (B,A,d) — якорів. Повний шар: якорі вписуються в hh, шар іде по
+    всіх словах, якорі зчитуються назад. Порядок шарів не змінюється."""
+    B, T, d = h.shape
+    L = jax.tree.leaves(ps)[0].shape[0]
+    fcfg = _full_cfg(cfg)
+    s_all = jnp.clip(s_, 0, 50)                                               # усі слова справжні (sa ≥ 0)
+    bi = jnp.arange(B)[:, None]
+
+    def anch(a, p):
+        a, aux, dr, fl, ac = bank_moe(p, a, sa, cfg, exchange, with_fill=True)
+        return a, (aux, dr, fl, ac)
+
+    def full(hh, p):
+        hh, aux, dr, fl, ac = bank_moe(p, hh, s_all, fcfg, exchange, with_fill=True)
+        return hh, (aux, dr, fl, ac)
+    if remat:
+        pol = None if remat is True else remat
+        anch, full = jax.checkpoint(anch, policy=pol), jax.checkpoint(full, policy=pol)
+    sp = jax.tree.map(lambda l: [u[0] for u in lax.split(l, (1,) * L, 0)], ps)
+    layer = lambda i: jax.tree.map(lambda l: l[i], sp, is_leaf=lambda v: isinstance(v, list))
+    ys = []
+    if all_full:
+        hh = h
+        for i in range(L):
+            hh, y = full(hh, layer(i))
+            ys.append(y)
+        out = hh
+    else:
+        sa = jnp.where(valid, jnp.clip(jnp.take_along_axis(s_, idx, 1), 0, 50), -1.0)
+        a = jnp.take_along_axis(h, idx[..., None], 1)
+        hh = h
+
+        def put_anchors(hh, a):
+            cur = jnp.take_along_axis(hh, idx[..., None], 1)
+            return hh.at[bi, idx].set(jnp.where(valid[..., None], a, cur))
+        for i in range(L):
+            p = layer(i)
+
+            def do_full(c, p=p):
+                hh, a = c
+                hh, y = full(put_anchors(hh, a), p)
+                return (hh, jnp.take_along_axis(hh, idx[..., None], 1)), y
+
+            def do_anch(c, p=p):
+                hh, a = c
+                a, y = anch(a, p)
+                return (hh, a), y
+            (hh, a), y = lax.cond(full_idx == i, do_full, do_anch, (hh, a))
+            ys.append(y)
+        out = put_anchors(hh, a)
+    auxs, drs, fls, acs = (jnp.stack(t) for t in zip(*ys))
+    if stats is not None:
+        stats["moe_fill"] = fls.mean()
+        if cfg.layer_stats:
+            stats["moe_drop_l"], stats["moe_active_l"] = drs, acs
+    return out, auxs.mean(), drs.mean()
+
+
 def heavy_stack(ps, h, idx, valid, s_, cfg, exchange=IDENTITY, remat=False, stats=None):
     """Важка частина FullLM2 (full2.py:1688-1708): якорі → 14 × bank_moe (lax.scan) → scatter_add назад.
     ps — стек параметрів з віссю шару; h (B,T,d); idx (B,A) int; valid (B,A) bool; s_ (B,T) fp32.
@@ -298,8 +369,8 @@ def heavy_stack(ps, h, idx, valid, s_, cfg, exchange=IDENTITY, remat=False, stat
     sa = jnp.where(valid, sa, -1.0)
 
     def body(a, p):
-        a, aux, dr, fl = bank_moe(p, a, sa, cfg, exchange, with_fill=True)
-        return a, (aux, dr, fl)
+        a, aux, dr, fl, ac = bank_moe(p, a, sa, cfg, exchange, with_fill=True)
+        return a, (aux, dr, fl, ac)
     if remat:
         body = jax.checkpoint(body, policy=None if remat is True else remat)   # remat: True або policy
     if cfg.unroll:
@@ -311,11 +382,13 @@ def heavy_stack(ps, h, idx, valid, s_, cfg, exchange=IDENTITY, remat=False, stat
         for i in range(L):
             a, y = body(a, jax.tree.map(lambda l: l[i], sp, is_leaf=lambda v: isinstance(v, list)))
             ys.append(y)
-        auxs, drs, fls = (jnp.stack(t) for t in zip(*ys))
+        auxs, drs, fls, acs = (jnp.stack(t) for t in zip(*ys))
     else:
-        a, (auxs, drs, fls) = lax.scan(body, a_in, ps)
+        a, (auxs, drs, fls, acs) = lax.scan(body, a_in, ps)
     if stats is not None:
         stats["moe_fill"] = fls.mean()
+        if cfg.layer_stats:                                       # по шарах (L,): лише лог (MOE_LAYER_STATS=1)
+            stats["moe_drop_l"], stats["moe_active_l"] = drs, acs
     delta = (a - a_in) * valid[..., None].astype(a.dtype)
     bi = jnp.arange(B)[:, None]
     h = h.at[bi, idx].add(delta)                                              # idx у рядку різні

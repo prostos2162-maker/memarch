@@ -97,6 +97,28 @@ reports step time, tokens/s, MFU and peak HBM. Installation, flags and environme
 Measured throughput (Nov 6, 2026): the full ~12B model trains at **507k tokens/s on 8× TPU v6e**
 (517 ms per step, 4×8192 tokens per chip, memory, experts and the Instinct optimizer on).
 
+Main training run (Nov 12, 2026, `memarch_jax/memarch_jax/train_tpu.py`): ~12B parameters with fishki layers
+(below) and the rope memory, **550k tokens/s on 8× TPU v6e** (472 ms per step, 4×8192 tokens per chip),
+6.8 of 31 GB HBM per chip. `DIAG=1` turns on a diagnostic mode (`diag.py`): start-up phases with per-chip
+memory, every XLA compilation, a step profile, and a stack dump of all threads if the log stalls.
+
+## Rope memory
+
+The rope memory (`rope.py`, `rope_read_v3.py`, flag `--rope_mem`) keeps anchor words of the text and lets a
+light layer open them again far behind its attention window. On a small model it recalls facts placed 8k / 16k /
+32k tokens back at 100% / 99% / 98%. The v3 read kernel (Pallas) brought the memory section of the step from
+575 to about 190 ms on TPU v6e.
+
+## Fishki
+
+The heavy part of the model is a set of equal small FFN layers, "fishki" (`fishki.py`, flags `--fish_*`).
+Each text kind (code, math, Ukrainian, English, other languages) has its own overlapping set. In training, a whole
+step is one text kind and uses only 2 randomly chosen fishki of that kind's set, so no single word is routed
+between chips; the finished model gives each word about 2B active parameters through a router. In tests at equal
+training time, a model trained this way beat the same model trained in its finished form throughout (−0.12 loss
+on a small model, −0.06 to −0.18 on a larger one, with no shrinking of the gap). Unused fishki are frozen for the
+step (no weight decay or momentum).
+
 ## Instinct optimizer
 
 Instinct (`exp_opt.InstinctOptB`, JAX version in `memarch_jax/memarch_jax/instinct.py`) is the project's own
@@ -130,7 +152,7 @@ Code comments are in Ukrainian.
 
 ## Status and next steps
 
-The architecture and data are ready for a main training run (~12B total / ~2B active, distilled from Qwen3.6-35B-A3B, target: a coding LLM with strong Ukrainian). The JAX/TPU port is in place and reaches the 500k tokens/s throughput target on 8 TPU v6e chips. The next steps are an AdamW 1B baseline, multiple seeds, downstream benchmarks, and long-context tests of the memory system.
+**The main training run started on Nov 12, 2026** (~12B total / ~2B active per word in the finished model, target: a coding LLM with strong Ukrainian), at 550k tokens/s on 8 TPU v6e chips. The fishki final phase (full sets per text kind with the router) and distillation from Qwen3.6-35B-A3B are planned for the later part of training. Next: recall and benchmarks on the first checkpoints, long-context tests of the memory system.
 
 ## License
 

@@ -2,7 +2,7 @@ r"""M12: комбінований тест — УСІ стовпи разом (i
 reread, легка голова, короткий словник) + Instinct, W=1, fp32, SR вимкнено. 20 кроків JAX (step.make_train_step, одна
 jit) проти torch (full2.FullLM2 + exp_opt.InstinctOptB): та сама ініціалізація (convert), ті самі батчі, той самий lr.
 Порівнюємо криву loss, члени, стати, tau, s/stake/k Instinct і розбіжність ваг щокроку.
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_combined.py"""
+Запуск: cd D:\ai\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_combined.py"""
 import os
 import sys
 import tempfile
@@ -29,7 +29,7 @@ sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
 import torch                                                     # noqa: E402
 torch.save(torch.from_numpy(LT), os.environ["LOCK_TRUST"])
-import _mem_ref                                                  # noqa: E402  (шлях до the torch code root, stable_torch)
+import _mem_ref                                                  # noqa: E402  (шлях до D:\ai\memarch, stable_torch)
 import full2                                                     # noqa: E402
 import torch.distributed as _dist                                # noqa: E402
 if not _dist.is_initialized():

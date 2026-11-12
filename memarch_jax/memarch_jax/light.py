@@ -52,6 +52,16 @@ def pre_attn(p, x, cfg):
     return q, k, v
 
 
+def pre_attn_rope(p, x, cfg):
+    """Як pre_attn, але віддає і ключі без RoPE (вагонетка: вибір груп без обертання).
+    → qr, kr (з RoPE, dtype x), qu, ku (без RoPE), v — усі (B,H,T,hd)."""
+    B, T, D = x.shape
+    H, hd = cfg.heads, D // cfg.heads
+    n1 = rmsnorm(x, p["n1"])
+    qu, ku, v = (linear(n1, p["qkv"][i * D:(i + 1) * D]).reshape(B, T, H, hd).transpose(0, 2, 1, 3) for i in range(3))
+    return rope_half(qu, cfg.rope_base), rope_half(ku, cfg.rope_base), qu, ku, v
+
+
 def post_attn(p, x, a, cfg):
     """x += o(a) ; x += down(relu(up(n2 x))²). Мітки checkpoint_name — для remat-політик (model.REMAT_POLICIES)."""
     B, T, D = x.shape

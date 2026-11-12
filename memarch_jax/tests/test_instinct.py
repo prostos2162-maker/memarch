@@ -1,6 +1,6 @@
 """Паритет Instinct (memarch_jax.instinct) проти torch exp_opt.InstinctOptB на CPU, W=1, SR вимкнено.
 
-Запуск: cd memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_instinct.py   (або python -m pytest)
+Запуск: cd D:\\ai\\memarch_jax && PYTHONIOENCODING=utf-8 python tests/test_instinct.py   (або python -m pytest)
 """
 import os
 import sys
@@ -10,7 +10,7 @@ os.environ.pop("BF16_ALL", None)
 os.environ.pop("PALLAS_OPT", None)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))  # repo root: torch reference code
+sys.path.insert(0, r"D:\ai\memarch")
 
 import numpy as np
 import torch

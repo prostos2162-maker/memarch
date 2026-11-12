@@ -1,14 +1,14 @@
 """Конфігурація моделі (Fv2moeK40h14d2560 і малі тестові) + сталі з файлів (sv_*, lock_bucket, LOCK_TRUST).
 
 Сталі будуються numpy так само, як буфери FullLM2 (full2.py:1310-1338 і 1405-1418): ті самі файли, що на VM
-(phr/counts_fineweb.npy, phr/lock_trust.pt) → побітово ті самі масиви."""
+(_tmp/phr/counts_fineweb.npy, _tmp/phr/lock_trust.pt) → побітово ті самі масиви."""
 import dataclasses
 import math
 import os
 
 import numpy as np
 
-_PHR = os.environ.get("MEMARCH_PHR", "phr")
+_PHR = r"D:\ai\memarch\_tmp\phr"
 DEFAULT_COUNTS = os.path.join(_PHR, "counts_fineweb.npy")
 DEFAULT_LOCK_TRUST = os.path.join(_PHR, "lock_trust.pt")
 
@@ -60,14 +60,64 @@ class Cfg:
     dtype: str = "bf16"
     attn_impl: str = "dense"     # "dense" (CPU-еталон) | "splash" (TPU, Pallas)
     rope_base: float = 10000.0
-    # --- «обруч» (hoop.py): важкі шари лише для слів, де модель сама чекає своєї помилки (замість якорів)
-    hoop: bool = False           # False — старі якорі за здивуванням легкої голови (tau)
-    hoop_budget: float = 0.25    # частка слів у важкі шари (статичний top-k; рівень = компіляція)
-    hoop_levels: tuple = (0.25, 0.18, 0.12, 0.08)   # спадні рівні бюджету для hoop.next_budget
-    hoop_eat: float = 1.0        # поріг «з'їденого» слова: передбачена помилка < hoop_eat нат
-    hoop_w: float = 0.1          # вага MSE голови обруча в loss
-    hoop_thr: float = -1.0       # ≥0: каузальний відбір (eval): слово йде у важкі, якщо ŝ > поріг (без top-k)
-    hoop_at: str = "light_b"     # де стоїть голова: "light_b" (lh, після пам'яті) | "light_a" (до пам'яті)
+    # --- «обруч» (uroboros.py): важкі шари лише для слів, де модель сама чекає своєї помилки (замість якорів)
+    uroboros: bool = False           # False — старі якорі за здивуванням легкої голови (tau)
+    uroboros_budget: float = 0.25    # частка слів у важкі шари (статичний top-k; рівень = компіляція)
+    uroboros_levels: tuple = (0.25, 0.18, 0.12, 0.08)   # спадні рівні бюджету для uroboros.next_budget
+    uroboros_eat: float = 1.0        # поріг «з'їденого» слова: передбачена помилка < uroboros_eat нат
+    uroboros_w: float = 0.1          # вага MSE голови обруча в loss
+    uroboros_thr: float = -1.0       # ≥0: каузальний відбір (eval): слово йде у важкі, якщо ŝ > поріг (без top-k)
+    uroboros_at: str = "light_b"     # де стоїть голова: "light_b" (lh, після пам'яті) | "light_a" (до пам'яті)
+
+    # --- «вагонетка» (rope.py): пам'ять-якорі замість mem2 і перечитування, лише в light_b. False — модель без змін
+    rope: bool = False
+    rope_k: int = 4
+    rope_links: int = 8
+    rope_win: int = 64
+    remind: bool = False             # нагадування (голки ключ→значення в тексті): prep["rem"] + доданок remind
+    remind_w: float = 1.0            # вага доданку remind (сума NLL відповідей / (B·remind_q))
+    remind_use_w: float = 0.0        # штраф на питаннях нагадувань: w·mean(1 − частка троса); 0 — немає
+    remind_only: bool = False        # етап 1 (--remind_synth): втрата лише на відповідях (+aux/light), без main
+    remind_mean: bool = False        # доданок remind = середнє по відповідях батчу (--remind_pack: відповідей у рядку багато)
+    remind_q: int = 16               # питань на рядок-нагадування (нормування як у torch: середнє за кроки = p·CE)
+    rope_span_cap: int = 256
+    rope_gather_cap: int = 0         # слів на запит у зібраній частині; 0 → k·span_cap (точно, без переповнення)
+    rope_route: str = "hier"         # "hier" | "exact"
+    rope_hier_g: int = 64
+    rope_hier_nb: int = 16
+    rope_hier_bm: int = 64
+    rope_excl_win: bool = True
+    rope_route_rot: bool = True
+    rope_rgrad: bool = True
+    rope_chunk: int = 256            # запитів на шматок уваги (lax.map + checkpoint)
+    rope_route_lazy: bool = False    # rope.RopeCfg.route_lazy
+    rope_dense_read: bool = False    # rope.RopeCfg.dense_read
+    rope_route_bf16: bool = False    # rope.RopeCfg.route_bf16
+    rope_pallas: bool = False        # rope.RopeCfg.pallas (Pallas-ядра, exact route)
+    fish_n: int = 0                  # «фішки» (Стефан 11.11): >0 — важкі MoE замінено на fish_n однакових FFN-шарів
+    fish_hf: int = 19456             # ширина фішки (2·d·hf ≈ 0.1B при d=2560)
+    fish_kinds: int = 5              # видів тексту (комбінацій)
+    fish_pool: int = 17              # фішок у наборі виду (готова модель: ~17·0.1B ≈ 1.7B + легкі ≈ 2B на слово)
+    fish_eval: bool = False          # оцінка готової моделі: вид рядка вибирає роутер, рядок іде через увесь набір
+    fish_c: int = 2                  # фішок за крок на тренуванні (випадкові з набору виду)
+    heavy_rotate: bool = False       # ідея Стефана 11.11: важкий шар номер prep['hfull'] цього кроку — на ВСІХ словах (тасування)
+    heavy_all: bool = False          # усі важкі шари на всіх словах (фінальна фаза перед SFT / готова модель)
+    rope_doc_eos: int = -1           # >=0: id токена EOS; трос не відкриває якорі з іншого документа (лише маска, без змін ядер)
+    rope_read: str = "v3"            # rope.RopeCfg.read: "v1" старе ядро читання, "v3" — rope_read_v3 (швидше, та сама математика)
+    rope_layers: int = 0             # у скількох перших шарах light_b вагонетка (0 — у всіх); решта — звичайна локальна увага
+    rope_share_route: bool = False   # другий і далі шари беруть вибір якорів першого (зміна семантики — потрібна перевірка пригадування)
+    rope_tau0: float = 5.0           # початковий поріг якорів (full2.rope_tau)
+    rope_qfrac: float = 1.0          # частка слів, що читають трос (решта — лише вікно); 1.0 = як було (ROPE_QFRAC у full2)
+    rope_qtau0: float = 5.0          # початковий поріг QFRAC (EMA квантиля 1-qfrac у навчанні, заморожений в оцінці)
+
+    # старі назви (hoop*) — лише читання, для сумісності зі старим кодом
+    hoop = property(lambda self: self.uroboros)
+    hoop_budget = property(lambda self: self.uroboros_budget)
+    hoop_levels = property(lambda self: self.uroboros_levels)
+    hoop_eat = property(lambda self: self.uroboros_eat)
+    hoop_w = property(lambda self: self.uroboros_w)
+    hoop_thr = property(lambda self: self.uroboros_thr)
+    hoop_at = property(lambda self: self.uroboros_at)
 
     @property
     def heads(self):
