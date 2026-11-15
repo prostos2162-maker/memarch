@@ -205,11 +205,13 @@ class KindCorpus:
     залежить лише від номера кроку), комбінація фішок — випадкова з набору виду (seed, крок) — теж однакова скрізь.
     full=True (фінальна фаза) — весь набір виду в його порядку. extra() → {'kind': (B,1), 'fish': (B,C)} для prep."""
 
-    def __init__(self, kinds, pools, c, root=DEFAULT_ROOT, seq=8192, seed=0, rank=0, world=1, cache=None, eos=None):
+    def __init__(self, kinds, pools, c, root=DEFAULT_ROOT, seq=8192, seed=0, rank=0, world=1, cache=None, eos=None,
+                 doc_seed=None):
         self.names = list(kinds)
         w = np.array([sum(kinds[k].values()) for k in self.names], np.float64)
         self.p = w / w.sum()
-        self.subs = [Corpus(kinds[k], root=root, seq=seq, seed=seed + 7919 * i, rank=rank, world=world, cache=cache,
+        ds_ = seed if doc_seed is None else doc_seed          # 14.11 --data_reseed: інші документи, той самий розклад видів
+        self.subs = [Corpus(kinds[k], root=root, seq=seq, seed=ds_ + 7919 * i, rank=rank, world=world, cache=cache,
                             eos=eos) for i, k in enumerate(self.names)]
         self.eos = self.subs[0].eos
         self.pools, self.c, self.seed = pools, int(c), seed
@@ -241,8 +243,9 @@ class KindCorpus:
         return {"subs": [s.state_dict() for s in self.subs], "count": self.count.tolist(), "n": self.n}
 
     def load_state_dict(self, st):
-        for s, ss in zip(self.subs, st["subs"]):
-            s.load_state_dict(ss)
+        if st.get("subs") is not None:                      # None — --data_reseed: документи з нового зерна з початку
+            for s, ss in zip(self.subs, st["subs"]):
+                s.load_state_dict(ss)
         self.count = np.array(st["count"], np.float64)
         self.n = int(st["n"])
 
@@ -352,7 +355,7 @@ class Reminders:
     def __init__(self, p, T, n=16, dist=2048, tok0=1000, seed=0, V=None, p0=None, warm=0, decay=0,
                  ladder=None, thr=0.9, win=800, lag=5, dmin=0, synth=0, pack=False,
                  pack_gap=0, pack_round=1, pack_mult=1, doc_eos=None,
-                 near=0.0, near_max=0):
+                 near=0.0, near_max=0, strict=False, pack_frac=None, win_ref=None, blank=False, tail=False):
         """Розклад (необов'язковий): p0 перші warm батчів, далі лінійно за decay батчів до p (кінцевого).
         ladder (необов'язковий): відстані рівнів (зростають). Рівень k: відстань рівно з [ladder[k-1], ladder[k]]
         (k=0: [dmin, ladder[0]]); останній рівень — уся [dmin, ladder[-1]] (як RECALL_MIX у torch: не забувати короткі).
@@ -369,6 +372,17 @@ class Reminders:
         # near: частка голок справжнього тексту на відстані 0..near_max (у вікні, трос відкритий) — щоб трос
         # не заважав близьким фактам (рішення Стефана 11.11: лікувати даними, не архітектурою)
         self.near, self.near_max = float(near), int(near_max)
+        self.strict = bool(strict)                           # --remind_strict: етап 1 віддає ще rem_vals (значення рядка)
+        # --remind_blank (Стефан 12.11, «відповіді бачиш лише після тесту»): у синтетичних епізодах на місці відповіді
+        # стоїть заглушка (mark), правильне значення — лише в rem_y (ціль втрати). Кожен prep тоді має rem_y.
+        self.blank = bool(blank)
+        # --remind_mix (Стефан 12.11): плавний перехід синтетика → текст: після етапу 1 частка СИНТЕТИЧНИХ кроків
+        # спадає фазами по mix_len кроків (напр. 0.9, 0.75, 0.5, 0.25, 0.05), остання частка лишається назавжди
+        self.mix_fracs, self.mix_len = None, 250
+        # ПРОПОЗИЦІЯ (--remind_tail, вимкнено): у короткому рядку етапу 1 сміття між фактами й питаннями лишається
+        # НОМІНАЛЬНИМ (16, 32, … як у драбині), а доповнення рядка до pack_round іде ПІСЛЯ питань (хвіст без втрати).
+        # Без прапорця округлення до 256 розтягує сміття рівня 0 з 16 до 241. Форма батчу й число відповідей ті самі.
+        self.tail = bool(tail)
         self.changes = [(0, 0)]                              # (з якого батчу, рівень)
         self.acc_h = self.acc_n = 0.0
         self.k0, self.v0, self.mark = tok0, tok0 + self.N_KEYS, tok0 + self.N_KEYS + self.N_VALS
@@ -378,17 +392,79 @@ class Reminders:
         self.pack, self.pack_gap = bool(pack), int(pack_gap)
         self.pack_round, self.pack_mult = max(1, int(pack_round)), max(1, int(pack_mult))
         if self.pack:
-            fl = [f for f in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
-                  if 4 * self.n + f <= self.T + 1]
+            if pack_frac:
+                # драбина в частках вікна моделі (Стефан 12.11): однакова для моделей різного розміру; без злиплих
+                # сходинок після округлення рядка до pack_round
+                assert win_ref, "pack_frac потребує win_ref (вікно моделі)"
+                fl = sorted({max(16, int(round(float(fr) * win_ref))) for fr in pack_frac})
+            else:
+                fl = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+            fl = [f for f in fl if 4 * self.n + f <= self.T + 1]
             assert fl, f"T={T} замале для епізоду з {self.n} пар і сміття 16"
             self.pfill = fl
-            self.plevels = [(pp, f) for f in fl for pp in sorted({min(4, self.n), min(8, self.n), self.n})]
+            lv, seen = [], set()
+            for f in fl:
+                for pp in sorted({min(4, self.n), min(8, self.n), self.n}):
+                    fn = f
+                    if pack_frac and self.pack_round > 1 and not self.tail:   # до НАЙБЛИЖЧОЇ кратної довжини, а не вгору
+                        # (з --remind_tail доповнення йде в хвіст після питань — номінальне сміття не чіпаємо)
+                        r_ = self.pack_round
+                        Ts = max(r_, int(round((4 * pp + f - 1) / r_)) * r_)
+                        fn = Ts + 1 - 4 * pp                        # номінальне f, яке _short_batch не змінить
+                    real = self.real_fill(pp, fn)
+                    if pack_frac and (pp, real) in seen:            # та сама справжня відстань — не нова сходинка
+                        continue
+                    seen.add((pp, real))
+                    lv.append((pp, fn))
+            self.plevels = lv
             self.pchanges, self.pacc_h, self.pacc_n = [(0, 0)], 0.0, 0.0
         assert V is None or self.mark < V, f"токени нагадувань {tok0}..{self.mark} ≥ V {V}"
         assert self.n <= self.N_KEYS
         assert 2 * self.L + self.dist <= self.T + 1, f"T={T} замале для 2 блоків по {self.L} і відстані {dist}"
         if self.ladder:
             assert self.ladder == sorted(self.ladder) and self.ladder[-1] <= self.T + 1 - 2 * self.L, self.ladder
+
+    def synth_at(self, n):
+        """Чи батч n — синтетичний (етап 1). До self.synth — завжди; далі — за --remind_mix (детерміновано від n)."""
+        if n is None:
+            return False
+        if n < self.synth:
+            return True
+        if not self.mix_fracs:
+            return False
+        k = min((n - self.synth) // max(self.mix_len, 1), len(self.mix_fracs) - 1)
+        return ((n * 0.6180339887498949) % 1.0) < self.mix_fracs[k]
+
+    def real_fill(self, pp, f):
+        """Справжнє сміття короткого рядка етапу 1 після округлення довжини до pack_round (як _short_batch)."""
+        if getattr(self, "tail", False):                        # --remind_tail: сміття номінальне, доповнення — у хвості
+            return f
+        Ts = -(-(4 * pp + f - 1) // self.pack_round) * self.pack_round
+        return Ts + 1 - 4 * pp
+
+    far_frac, far_win = None, 2048
+
+    def _pick_last(self, rng, pp, fs):
+        """Останній рівень: довжина сміття батчу. За замовчуванням — рівномірно з усіх довжин (з 9 лише 2 за вікном,
+        і 12.11 журнали показали: пригадування за вікном слабне 0.94–0.98 → 0.59–0.74 ще на чистій синтетиці).
+        --remind_far_frac F: з імовірністю F — довжина за вікном (сміття + 2 > far_win, тобто лише трос), інакше у вікні."""
+        if self.far_frac is None:
+            return fs[int(rng.integers(0, len(fs)))]
+        far = [f for f in fs if self.real_fill(pp, f) + 2 > self.far_win]
+        near = [f for f in fs if f not in far]
+        pool = (far if rng.random() < self.far_frac else near) if far and near else fs
+        return pool[int(rng.integers(0, len(pool)))]
+
+    def pack_fill_at(self, n):
+        """(пар, справжнє сміття) синтетичного батчу n — та сама детермінована вибірка, що й у _short_batch
+        (на останньому рівні довжина сміття випадкова на батч). Для журналу точності окремо за вікном і у вікні."""
+        k = self.plevel_at(n)
+        pp, f = self.plevels[k]
+        if k == len(self.plevels) - 1:
+            rng = np.random.default_rng([self.seed, 7919, n])
+            fs = [f_ for p_, f_ in self.plevels if p_ == pp] or self.pfill
+            f = self._pick_last(rng, pp, fs)
+        return pp, self.real_fill(pp, f)
 
     def _filler(self, rng, n):
         """Випадкові слова поза токенами голок (torch: FILL0..FILL0+20000)."""
@@ -449,6 +525,9 @@ class Reminders:
         Ключі — з перестановок 512 поспіль (той самий ключ повториться не ближче ніж через ~512/pp епізодів)."""
         T1, Le, g = len(row), 4 * pp + f, self.pack_gap
         ne = (T1 + g) // (Le + g)
+        # ключі в рядку без повторів (решта рядка — сміття): з повторами 49–68% питань мали в тому ж рядку той самий ключ
+        # з іншим значенням, і точність eval pack_fN була б занижена навіть у ідеальної моделі (12.11, Стефан: полагодь)
+        ne = min(ne, self.N_KEYS // pp)
         off = T1 - (ne * Le + (ne - 1) * g)
         if g:
             row[:off] = self.mark
@@ -478,27 +557,40 @@ class Reminders:
         pp, f = self.plevels[k]
         rng = np.random.default_rng([self.seed, 7919, n])
         if k == len(self.plevels) - 1:                      # останній рівень: усі довжини сміття впереміш (torch RECALL_MIX)
-            f = self.pfill[int(rng.integers(0, len(self.pfill)))]
+            fs = [f_ for p_, f_ in self.plevels if p_ == pp] or self.pfill   # ті самі відстані, що й на сходинках
+            f = self._pick_last(rng, pp, fs)
         Ts = -(-(4 * pp + f - 1) // self.pack_round) * self.pack_round          # довжина x
-        f = Ts + 1 - 4 * pp
+        if not self.tail:
+            f = Ts + 1 - 4 * pp
         m = self.pack_mult
         R = max(m, (B * (T1 - 1) // Ts) // m * m)
         xy = np.empty((R, Ts + 1), np.int32)
+        if self.tail:                                           # хвіст рядка після питань — сміття (втрати там немає)
+            xy[:] = self._filler(rng, R * (Ts + 1)).reshape(R, Ts + 1)
         rem = np.zeros((R, Ts), np.int8)
         ans = 2 * pp + f + 2 * np.arange(pp)
+        rv = np.full((R, self.n), -1, np.int32)                 # значення фактів рядка (для --remind_strict), решта −1
+        ry = np.zeros((R, Ts), np.int32)                        # --remind_blank: ціль на місцях відповідей
         for r in range(R):
             keys = self.k0 + rng.permutation(self.N_KEYS)[:pp]
             vals = self.v0 + rng.integers(0, self.N_VALS, pp)
             qi = rng.permutation(pp)
             xy[r, :2 * pp] = np.stack([keys, vals], 1).reshape(-1)
             xy[r, 2 * pp:2 * pp + f] = self._filler(rng, f)
-            xy[r, 2 * pp + f:] = np.stack([keys[qi], vals[qi]], 1).reshape(-1)
+            xy[r, 2 * pp + f:4 * pp + f] = np.stack([keys[qi], vals[qi]], 1).reshape(-1)
             rem[r, ans] = 1
-        return xy, {"rem": rem}
+            rv[r, :pp] = vals
+            if self.blank:
+                ry[r, ans] = vals[qi]
+                xy[r, 2 * pp + f + 1:4 * pp + f:2] = self.mark      # відповідь у тексті не видно — лише в оцінці
+        ex = {"rem": rem, "rem_vals": rv} if self.strict else {"rem": rem}
+        if self.blank:
+            ex["rem_y"] = ry
+        return xy, ex
 
     def observe(self, i, hits, n_ans):
         """Головний цикл після кроку i (батч i): точність голок у train → можливий перехід. → рядок або None."""
-        if self.pack and i < self.synth:
+        if self.pack and self.synth_at(i):
             return self._observe_pack(i, hits, n_ans)
         if not self.ladder:
             return None
@@ -544,21 +636,89 @@ class Reminders:
         kv = np.stack([keys, vals], 1).reshape(-1)
         qi = rng.permutation(n)
         qs = np.stack([keys[qi], vals[qi]], 1).reshape(-1)
-        row[s] = row[s + L - 1] = self.mark
-        row[s + 1:s + L - 1] = kv
-        row[q] = row[q + L - 1] = self.mark
-        row[q + 1:q + L - 1] = qs
+        if self.same_fmt:   # 12.11: той самий формат, що й синтетика етапу 1: [k v]·n без міток, питання [k v]·n
+            # як у синтетиці (там сміття взагалі без токенів голок): ключі й значення цієї голки в рядку більше ніде
+            # не трапляються — у справжньому тексті токени 1000..1576 звичайні, і трос знаходив хибні збіги ключа
+            # (12.11, заміри на справжніх шматках: токени 1000..1576 — це 4.6–7.2% англ./коду/матем., ~375–587 на рядок
+            # 8192; синтетика вчила «кожен такий токен — факт», тож у тексті трос тонув у хибних фактах) → увесь діапазон
+            hit = (row >= self.k0) & (row <= self.mark)
+            if hit.any():
+                row[hit] = self._filler(rng, int(hit.sum()))
+            row[s:s + 2 * n] = kv                     # (значення питань __call__ ховає заглушкою, ціль — rem_y)
+            row[q:q + 2 * n] = qs
+            pos = q + 2 * np.arange(n)
+        else:
+            row[s] = row[s + L - 1] = self.mark
+            row[s + 1:s + L - 1] = kv
+            row[q] = row[q + L - 1] = self.mark
+            row[q + 1:q + L - 1] = qs
+            pos = q + 1 + 2 * np.arange(n)
         if self.doc_eos is not None:                        # межі документів між фактами й питанням → сміття
             seg = row[s:q + L]
             hit = seg == self.doc_eos
             if hit.any():
                 seg[hit] = self._filler(rng, int(hit.sum()))
-        return q + 1 + 2 * np.arange(n)                     # позиції ключів-питань (у x; y там = значення)
+        return pos                                          # позиції ключів-питань (у x; y там = значення)
+
+    same_fmt = False
+    per_row, far_log = 1, None      # 13.11 (solve_curriculum): --remind_per_row, --remind_far_log
+
+    def _multi(self, row, rng):
+        """13.11 (solve_curriculum): кілька голок у рядку тексту (формат --remind_same_fmt: [k v]·n, питання [k v]·n).
+        Ключі всіх голок рядка різні; блоки не накладаються (голки можуть вкладатися одна в одну — як у розмові).
+        Відстань: з імовірністю far_log — лог-рівномірно від dist (за вікном) до кінця рядка; інакше 0..near_max.
+        → позиції ключів-питань (у x; y там = значення)."""
+        n, T1 = self.n, len(row)
+        Lb = 2 * n
+        hit = (row >= self.k0) & (row <= self.mark)       # як _row(same_fmt): слова голок більше ніде в рядку
+        if hit.any():
+            row[hit] = self._filler(rng, int(hit.sum()))
+        R = max(1, min(int(self.per_row), self.N_KEYS // n))
+        keys_all = self.k0 + rng.permutation(self.N_KEYS)[:R * n]
+        occ = np.zeros(T1, bool)
+        dmax = T1 - 2 * Lb
+        far = self.far_log if self.far_log is not None else 1.0 - self.near
+        lo = max(1, min(self.dist, dmax))
+        pos = []
+        for r in range(R):
+            for _ in range(32):
+                if rng.random() < far:
+                    d = int(np.exp(rng.uniform(np.log(lo), np.log(dmax + 1))))
+                    d = min(max(d, lo), dmax)
+                else:
+                    d = int(rng.integers(0, min(self.near_max, dmax) + 1))
+                s = int(rng.integers(0, dmax - d + 1))
+                q = s + Lb + d
+                if occ[s:s + Lb].any() or occ[q:q + Lb].any():
+                    continue
+                keys = keys_all[r * n:(r + 1) * n]
+                vals = self.v0 + rng.integers(0, self.N_VALS, n)
+                qi = rng.permutation(n)
+                row[s:s + Lb] = np.stack([keys, vals], 1).reshape(-1)
+                row[q:q + Lb] = np.stack([keys[qi], vals[qi]], 1).reshape(-1)
+                occ[s:s + Lb] = occ[q:q + Lb] = True
+                if self.doc_eos is not None:                # межі документів між фактами й питанням → сміття
+                    seg = row[s:q + Lb]
+                    he = seg == self.doc_eos
+                    if he.any():
+                        seg[he] = self._filler(rng, int(he.sum()))
+                pos.append(q + 2 * np.arange(n))
+                break
+        return np.sort(np.concatenate(pos)) if pos else np.zeros(0, np.int64)
+
+    def _hide(self, xy, b, pq, ry_pack):
+        """--remind_same_fmt + --remind_blank: як у синтетиці — значення в питаннях не видно (заглушка), ціль у rem_y."""
+        if not (self.same_fmt and self.blank):
+            return
+        ry_b = ry_pack.setdefault(b, {})
+        for p_ in pq:
+            ry_b[int(p_)] = int(xy[b, p_ + 1])
+        xy[b, pq + 1] = self.mark
 
     def __call__(self, xy, p=None, exact=None, n=None, synth=None, pack=None):
         import zlib
         if synth is None:
-            synth = n is not None and n < self.synth
+            synth = self.synth_at(n)
         rng_d = None
         if n is not None and p is None:                     # train-батч n: розклад частки і рівень драбини
             p = self.p_at(n)
@@ -569,6 +729,7 @@ class Reminders:
         xy = np.array(xy, copy=True)
         B, T1 = xy.shape
         rem = np.zeros((B, T1 - 1), np.int8)
+        ry_pack = {}                                            # --remind_blank: справжні відповіді до заміни заглушкою
         for b in range(B):
             rng = np.random.default_rng([self.seed, zlib.crc32(xy[b].tobytes())])
             if synth and (pack is not None or (self.pack and n is not None)):   # щільні епізоди torch (--remind_pack)
@@ -580,13 +741,34 @@ class Reminders:
                     pp, f = self.plevels[k]
                     if k == len(self.plevels) - 1:          # останній рівень: усі довжини сміття впереміш (torch RECALL_MIX)
                         f = self.pfill[int(rng.integers(0, len(self.pfill)))]
-                rem[b, self._pack_row(xy[b], rng, pp, f)] = 1
+                pq = self._pack_row(xy[b], rng, pp, f)
+                rem[b, pq] = 1
+                if self.blank:                                      # eval pack_fN теж без видимих відповідей
+                    ry_b = ry_pack.setdefault(b, {})
+                    for p_ in pq:
+                        ry_b[int(p_)] = int(xy[b, p_ + 1])
+                    xy[b, pq + 1] = self.mark
             elif synth:                                     # рядок — лише сміття + голка (torch recall_long.batch)
                 xy[b] = self._filler(rng, T1)
-                rem[b, self._row(xy[b], rng, exact, rng_d)] = 1
+                pq = self._row(xy[b], rng, exact, rng_d)
+                rem[b, pq] = 1
+                self._hide(xy, b, pq, ry_pack)
             elif rng.random() < p:
                 ex = exact
-                if ex is None and self.near > 0 and self.near_max > 0 and rng.random() < self.near:
+                if (ex is None and self.near > 0 and self.near_max > 0 and not (self.per_row > 1 or self.far_log is not None)
+                        and rng.random() < self.near):
                     ex = int(rng.integers(0, min(self.near_max, T1 - 2 * self.L) + 1))
-                rem[b, self._row(xy[b], rng, ex, None if ex is not None else rng_d)] = 1
-        return xy, {"rem": rem}
+                if ex is None and rng_d is None and (self.per_row > 1 or self.far_log is not None):
+                    pq = self._multi(xy[b], rng)            # 13.11: щільні голки в тексті (лише train; eval — як було)
+                else:
+                    pq = self._row(xy[b], rng, ex, None if ex is not None else rng_d)
+                rem[b, pq] = 1
+                self._hide(xy, b, pq, ry_pack)
+        out = {"rem": rem}
+        if self.blank:                                          # ціль на відповідях: справжнє значення (і там, де заглушка)
+            ry = np.where(rem > 0, xy[:, 1:], 0).astype(np.int32)
+            for b, d in ry_pack.items():
+                for p_, v in d.items():
+                    ry[b, p_] = v
+            out["rem_y"] = ry
+        return xy, out

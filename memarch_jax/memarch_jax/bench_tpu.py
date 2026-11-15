@@ -125,8 +125,16 @@ def _cfg(args):
 def _consts(cfg, args):
     import numpy as np
     from . import model
+    if args.counts and not os.path.exists(args.counts):
+        raise SystemExit(f"--counts {args.counts}: файлу немає (раніше тихо підставлявся синтетичний Zipf)")
     if args.counts and os.path.exists(args.counts):
-        cnt = np.load(args.counts).astype(np.int64)[:cfg.V]
+        raw = np.load(args.counts)
+        # 13.11: тренування роками йшло з counts_fineweb.npy (50304 — словник GPT-2) при V=131328 (Qwen) —
+        # короткий словник і кошики замків будувались з чужих ідів. Тепер розмір мусить відповідати словнику.
+        if len(raw) < 0.95 * cfg.V and not os.environ.get("ALLOW_COUNTS_MISMATCH"):
+            raise SystemExit(f"--counts {args.counts}: {len(raw)} записів, а словник моделі V={cfg.V} — "
+                             f"частоти від іншого словника (для Qwen: counts_qwen.npy). ALLOW_COUNTS_MISMATCH=1 — свідомо.")
+        cnt = raw.astype(np.int64)[:cfg.V]
         cnt = np.pad(cnt, (0, cfg.V - len(cnt)))
     else:
         r = np.random.default_rng(0)

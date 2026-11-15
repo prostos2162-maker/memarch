@@ -36,6 +36,35 @@ _ALIASES = {} if _os.environ.get("PALLAS_NO_ALIAS") == "1" else {3: 0, 4: 1}
 _ALIASES_B = {} if _ALIASES == {} else {4: 0, 5: 1}     # прохід Б: (sc, cinv, rinv, g, m, w) — m і w на місці
 
 
+# 15.11 швидкість відкатника (--opt_rollback): вихід m, w пишеться В БУФЕР ЗНІМКА (dst = (hit, sm, sw)), а не на
+# місце входу. Тоді вхідні m, w (стан ДО кроку = новий знімок) лишаються цілими без копії, а вибір «відкат чи ні»
+# робить саме ядро (hit → блок знімка), без окремого проходу jnp.where по всьому стволу. Математика та сама.
+def _with_dst(body, n_in):
+    """Тіло ядра з n_in входами → тіло з ще трьома входами (hit f32[1], sm, sw) і тими ж виходами."""
+    def k(*refs):
+        ins, (hit_ref, sm_ref, sw_ref), outs = refs[:n_in], refs[n_in:n_in + 3], refs[n_in + 3:]
+        body(*ins, *outs)
+
+        @pl.when(hit_ref[0] > 0)
+        def _rb():
+            outs[0][...] = sm_ref[...]
+            outs[1][...] = sw_ref[...]
+    return k
+
+
+def _dst_call(kernel, n_in, in_specs, aliases, args, dst, m_spec, w_spec, interpret, ndim_grid):
+    """(kernel, in_specs, aliases, args) з dst або без: dst → +3 входи, m/w-виходи — на місці sm/sw."""
+    if dst is None:
+        return kernel, in_specs, aliases, args
+    hit, sm, sw = dst
+    if pltpu is not None and not interpret:
+        h_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    else:
+        h_spec = pl.BlockSpec((1,), (lambda i: (0,)) if ndim_grid == 1 else (lambda e, j: (0,)))
+    return (_with_dst(kernel, n_in), list(in_specs) + [h_spec, m_spec, w_spec], {n_in + 1: 0, n_in + 2: 1},
+            tuple(args) + (jnp.asarray(hit, jnp.float32).reshape(1), sm.astype(jnp.bfloat16), sw.astype(jnp.bfloat16)))
+
+
 def _hash_u32(x):
     """lowbias32: дешевий якісний хеш 32-бітного лічильника (лише цілі множення, зсуви, xor — VPU)."""
     x = x ^ (x >> 16)
@@ -86,6 +115,36 @@ def _pass_a_rows(sc_ref, g_ref, m_ref, colsq_ref, rinv_ref):
     colsq_ref[...] += jnp.sum(u1 * u1, axis=0, keepdims=True)
 
 
+def _pass_a_rows_gg(sc_ref, g_ref, m_ref, colsq_ref, rinv_ref, gg_ref):
+    """Прохід А + Σg² тензора (--opt_gearbox): той самий прохід по g, ще одна скалярна сума — без окремого читання g."""
+    beta = sc_ref[0]
+
+    @pl.when(pl.program_id(0) == 0)
+    def _init():
+        colsq_ref[...] = jnp.zeros_like(colsq_ref)
+        gg_ref[...] = jnp.zeros_like(gg_ref)
+
+    g32 = g_ref[...].astype(jnp.float32)
+    mf = m_ref[...].astype(jnp.float32) * beta + g32 * (1 - beta)
+    r1 = 1.0 / (_rms(mf, 1) + EPS)
+    rinv_ref[...] = r1
+    u1 = mf * r1
+    colsq_ref[...] += jnp.sum(u1 * u1, axis=0, keepdims=True)
+    gg_ref[...] += jnp.sum(g32 * g32, keepdims=True)
+
+
+def _gear_scalars(scalars, gg, gear, axis_name):
+    """Σg² (локальна частина) → глобальна (psum по шардованій осі) → множник передачі gear=(fn, aux): fn(gg, aux) → cf.
+    lr_eff проходу Б = (sc[1]·cf)·aux[-1] — той самий порядок множень, що й у jnp-шляху (gear, далі snr)."""
+    gg = jnp.sum(gg)
+    if axis_name is not None:
+        gg = jax.lax.psum(gg, axis_name)
+    fn, aux = gear
+    cf = fn(gg, aux)
+    lr = ((scalars[1] * cf).astype(jnp.float32) * aux[-1]).astype(jnp.float32)
+    return scalars.at[1].set(lr), gg
+
+
 def _pass_b_rows(sc_ref, cinv_ref, rinv_ref, g_ref, m_ref, w_ref, m_out, w_out, *, BR, C):
     beta, lr_eff, wdmul = sc_ref[0], sc_ref[1], sc_ref[2]
     seed = jax.lax.bitcast_convert_type(sc_ref[3], jnp.uint32)
@@ -115,23 +174,34 @@ def _pick_block(n, pref, mult=8):
     return n
 
 
-def instinct_hs_2d(g, m, w, scalars, *, interpret=False, block_rows=256):
-    """Крок для 2D-ваги (R, C). scalars: f32[4] = (β, lr·eff, 1−lr·wd, насіння як біти f32). → (m_new, w_new)."""
+def instinct_hs_2d(g, m, w, scalars, *, interpret=False, block_rows=256, gear=None, axis_name=None):
+    """Крок для 2D-ваги (R, C). scalars: f32[4] = (β, lr·eff, 1−lr·wd, насіння як біти f32). → (m_new, w_new).
+    gear=(fn, aux) (--opt_gearbox): прохід А ще й рахує Σg², множник передачі fn(Σg², aux) іде в lr проходу Б;
+    → (m_new, w_new, Σg²)."""
     R, C = g.shape
     BR = _pick_block(R, min(block_rows, max(8, TILE_BYTES // (4 * C))))
     nb = R // BR
     smem = dict(memory_space=pltpu.SMEM) if (pltpu is not None and not interpret) else {}
     sc_spec = pl.BlockSpec(**smem) if smem else pl.BlockSpec((4,), lambda i: (0,))
     row_spec = pl.BlockSpec((BR, C), lambda i: (i, 0))
-    colsq, rinv = pl.pallas_call(
-        _pass_a_rows,
-        out_shape=(jax.ShapeDtypeStruct((1, C), jnp.float32), jax.ShapeDtypeStruct((R, 1), jnp.float32)),
+    a_shape = (jax.ShapeDtypeStruct((1, C), jnp.float32), jax.ShapeDtypeStruct((R, 1), jnp.float32))
+    a_specs = (pl.BlockSpec((1, C), lambda i: (0, 0)), pl.BlockSpec((BR, 1), lambda i: (i, 0)))
+    if gear is not None:
+        a_shape += (jax.ShapeDtypeStruct((1, 1), jnp.float32),)
+        a_specs += (pl.BlockSpec((1, 1), lambda i: (0, 0)),)
+    outs_a = pl.pallas_call(
+        _pass_a_rows if gear is None else _pass_a_rows_gg,
+        out_shape=a_shape,
         grid=(nb,),
         in_specs=[sc_spec, row_spec, row_spec],
-        out_specs=(pl.BlockSpec((1, C), lambda i: (0, 0)), pl.BlockSpec((BR, 1), lambda i: (i, 0))),
+        out_specs=a_specs,
         interpret=interpret,
         **_params(("arbitrary",), interpret),
     )(scalars, g, m)
+    colsq, rinv = outs_a[0], outs_a[1]
+    gg = None
+    if gear is not None:
+        scalars, gg = _gear_scalars(scalars, outs_a[2], gear, axis_name)
     cinv = 1.0 / (jnp.sqrt(colsq / R) + EPS)
     m_new, w_new = pl.pallas_call(
         functools.partial(_pass_b_rows, BR=BR, C=C),
@@ -144,7 +214,7 @@ def instinct_hs_2d(g, m, w, scalars, *, interpret=False, block_rows=256):
         interpret=interpret,
         **_params(("parallel",), interpret),
     )(scalars, cinv, rinv, g, m, w)
-    return m_new, w_new
+    return (m_new, w_new) if gear is None else (m_new, w_new, gg)
 
 
 # ------------------------------------------------------------------------------------------------- 3D (hs3)
@@ -164,6 +234,24 @@ def _pass_a_cols(sc_ref, g_ref, m_ref, rowsq_ref, cinv1_ref):
     rowsq_ref[...] += jnp.sum(u1 * u1, axis=2, keepdims=True)
 
 
+def _pass_a_cols_gg(sc_ref, g_ref, m_ref, rowsq_ref, cinv1_ref, gg_ref):
+    """Прохід А hs3 + Σg² кожного експерта (--opt_gearbox) — у тому ж проході по g."""
+    beta = sc_ref[0]
+
+    @pl.when(pl.program_id(1) == 0)
+    def _init():
+        rowsq_ref[...] = jnp.zeros_like(rowsq_ref)
+        gg_ref[...] = jnp.zeros_like(gg_ref)
+
+    g32 = g_ref[...].astype(jnp.float32)
+    mf = m_ref[...].astype(jnp.float32) * beta + g32 * (1 - beta)
+    r1 = 1.0 / (_rms(mf, 1) + EPS)
+    cinv1_ref[...] = r1
+    u1 = mf * r1
+    rowsq_ref[...] += jnp.sum(u1 * u1, axis=2, keepdims=True)
+    gg_ref[...] += jnp.sum(g32 * g32, keepdims=True)
+
+
 def _pass_b_cols(sc_ref, rinv_ref, cinv1_ref, g_ref, m_ref, w_ref, m_out, w_out, *, K, N, BN):
     beta, lr_eff, wdmul = sc_ref[0], sc_ref[1], sc_ref[2]
     seed = jax.lax.bitcast_convert_type(sc_ref[3], jnp.uint32)
@@ -179,23 +267,33 @@ def _pass_b_cols(sc_ref, rinv_ref, cinv1_ref, g_ref, m_ref, w_ref, m_out, w_out,
     m_out[...], w_out[...] = _sr_pair(mf, w_new, idx, seed)
 
 
-def instinct_hs3(g, m, w, scalars, *, interpret=False, block_cols=512):
-    """Крок для ваг експертів (E, K, N) з kind "hs3" (нормування: K → N → K). → (m_new, w_new)."""
+def instinct_hs3(g, m, w, scalars, *, interpret=False, block_cols=512, gear=None, axis_name=None):
+    """Крок для ваг експертів (E, K, N) з kind "hs3" (нормування: K → N → K). → (m_new, w_new).
+    gear — як в instinct_hs_2d (Σg² по експертах із проходу А) → (m_new, w_new, Σg²)."""
     E, K, N = g.shape
     BN = _pick_block(N, min(block_cols, max(128, TILE_BYTES // (4 * K))), mult=128)   # остання вісь — кратна 128
     nb = N // BN
     smem = dict(memory_space=pltpu.SMEM) if (pltpu is not None and not interpret) else {}
     sc_spec = pl.BlockSpec(**smem) if smem else pl.BlockSpec((4,), lambda e, j: (0,))
     tile = pl.BlockSpec((1, K, BN), lambda e, j: (e, 0, j))
-    rowsq, cinv1 = pl.pallas_call(
-        _pass_a_cols,
-        out_shape=(jax.ShapeDtypeStruct((E, K, 1), jnp.float32), jax.ShapeDtypeStruct((E, 1, N), jnp.float32)),
+    a_shape = (jax.ShapeDtypeStruct((E, K, 1), jnp.float32), jax.ShapeDtypeStruct((E, 1, N), jnp.float32))
+    a_specs = (pl.BlockSpec((1, K, 1), lambda e, j: (e, 0, 0)), pl.BlockSpec((1, 1, BN), lambda e, j: (e, 0, j)))
+    if gear is not None:
+        a_shape += (jax.ShapeDtypeStruct((E, 1, 1), jnp.float32),)
+        a_specs += (pl.BlockSpec((1, 1, 1), lambda e, j: (e, 0, 0)),)
+    outs_a = pl.pallas_call(
+        _pass_a_cols if gear is None else _pass_a_cols_gg,
+        out_shape=a_shape,
         grid=(E, nb),
         in_specs=[sc_spec, tile, tile],
-        out_specs=(pl.BlockSpec((1, K, 1), lambda e, j: (e, 0, 0)), pl.BlockSpec((1, 1, BN), lambda e, j: (e, 0, j))),
+        out_specs=a_specs,
         interpret=interpret,
         **_params(("parallel", "arbitrary"), interpret),
     )(scalars, g, m)
+    rowsq, cinv1 = outs_a[0], outs_a[1]
+    gg = None
+    if gear is not None:
+        scalars, gg = _gear_scalars(scalars, outs_a[2], gear, axis_name)
     rinv = 1.0 / (jnp.sqrt(rowsq / N) + EPS)
     m_new, w_new = pl.pallas_call(
         functools.partial(_pass_b_cols, K=K, N=N, BN=BN),
@@ -208,7 +306,7 @@ def instinct_hs3(g, m, w, scalars, *, interpret=False, block_cols=512):
         interpret=interpret,
         **_params(("parallel", "parallel"), interpret),
     )(scalars, rinv, cinv1, g, m, w)
-    return m_new, w_new
+    return (m_new, w_new) if gear is None else (m_new, w_new, gg)
 
 
 # ------------------------------------------------------------------------------------------------- vocab (таблиці слів)
@@ -229,23 +327,26 @@ def _vocab_rows(sc_ref, g_ref, m_ref, w_ref, m_out, w_out, *, BR, C):
     m_out[...], w_out[...] = _sr_pair(mf, w_new, idx, seed)
 
 
-def instinct_vocab(g, m, w, scalars, *, interpret=False, block_rows=256):
-    """Крок для таблиці слів (V, C), kind "vocab": один прохід. → (m_new, w_new)."""
+def instinct_vocab(g, m, w, scalars, *, interpret=False, block_rows=256, dst=None):
+    """Крок для таблиці слів (V, C), kind "vocab": один прохід. → (m_new, w_new). dst — див. _with_dst."""
     R, C = g.shape
     BR = _pick_block(R, min(block_rows, max(8, TILE_BYTES // (4 * C))))
     smem = dict(memory_space=pltpu.SMEM) if (pltpu is not None and not interpret) else {}
     sc_spec = pl.BlockSpec(**smem) if smem else pl.BlockSpec((4,), lambda i: (0,))
     row_spec = pl.BlockSpec((BR, C), lambda i: (i, 0))
+    kern, ins, al, args = _dst_call(functools.partial(_vocab_rows, BR=BR, C=C), 4,
+                                    [sc_spec, row_spec, row_spec, row_spec], {2: 0, 3: 1} if _ALIASES else {},
+                                    (scalars, g, m, w), dst, row_spec, row_spec, interpret, 1)
     return pl.pallas_call(
-        functools.partial(_vocab_rows, BR=BR, C=C),
+        kern,
         out_shape=(jax.ShapeDtypeStruct((R, C), jnp.bfloat16), jax.ShapeDtypeStruct((R, C), jnp.bfloat16)),
         grid=(R // BR,),
-        in_specs=[sc_spec, row_spec, row_spec, row_spec],
+        in_specs=ins,
         out_specs=(row_spec, row_spec),
-        input_output_aliases={2: 0, 3: 1} if _ALIASES else {},
+        input_output_aliases=al,
         interpret=interpret,
         **_params(("parallel",), interpret),
-    )(scalars, g, m, w)
+    )(*args)
 
 
 def _params(sem, interpret):

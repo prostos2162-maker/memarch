@@ -43,7 +43,16 @@ def splash(q, k, v, window, bq=1024, bkv=1024, bkvc=512):
     """TPU: splash_attention (Pallas, свій bwd). q заздалегідь множиться на 1/sqrt(hd) — у JAX-splash масштаб
     не вбудований. (Не перевірено на CPU; паритет з dense_ref — тест на TPU.)"""
     B, H, T, hd = q.shape
-    bq, bkv, bkvc = min(bq, T), min(bkv, T), min(bkvc, T)
+
+    def _blk(n, pref):                     # найбільший блок ≤ pref, на який n ділиться (splash вимагає кратності)
+        for b in (pref, 1024, 512, 256, 128):
+            if b <= pref and b <= n and n % b == 0:
+                return b
+        return n
+    # 12.11: короткі рядки етапу 1 (768, 1280, …) падали: «bkv=768 must be a multiple of bkv_compute=512».
+    # Для T=8192 блоки ті самі (1024/1024/512).
+    bq, bkv = _blk(T, bq), _blk(T, bkv)
+    bkvc = _blk(bkv, bkvc)
     kern = _splash_kernel(H, T, window, bq, bkv, bkvc)
     q = (q.astype(jnp.float32) * (1.0 / math.sqrt(hd))).astype(q.dtype)
     return jax.vmap(kern)(q, k, v)

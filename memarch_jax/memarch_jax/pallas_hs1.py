@@ -101,33 +101,37 @@ def _now_2d(g, m, scalars, interpret, block_rows):
     return colsq / R
 
 
-def _step_2d(g, m, w, col, scalars, interpret, block_rows):
+def _step_2d(g, m, w, col, scalars, interpret, block_rows, dst=None):
     R, C = g.shape
     BR = _block_rows(R, C, block_rows)
     row_spec = pl.BlockSpec((BR, C), lambda i: (i, 0))
     cinv = 1.0 / (jnp.sqrt(col) + EPS)
+    kern, ins, al, args = pi._dst_call(
+        functools.partial(_hs1_rows, BR=BR, C=C), 5,
+        [_smem_spec(interpret, 1), pl.BlockSpec((1, C), lambda i: (0, 0)), row_spec, row_spec, row_spec],
+        _ALIASES, (scalars, cinv, g, m, w), dst, row_spec, row_spec, interpret, 1)
     m_new, w_new, colsq = pl.pallas_call(
-        functools.partial(_hs1_rows, BR=BR, C=C),
+        kern,
         out_shape=(jax.ShapeDtypeStruct((R, C), jnp.bfloat16), jax.ShapeDtypeStruct((R, C), jnp.bfloat16),
                    jax.ShapeDtypeStruct((1, C), jnp.float32)),
         grid=(R // BR,),
-        in_specs=[_smem_spec(interpret, 1), pl.BlockSpec((1, C), lambda i: (0, 0)), row_spec, row_spec, row_spec],
+        in_specs=ins,
         out_specs=(row_spec, row_spec, pl.BlockSpec((1, C), lambda i: (0, 0))),
-        input_output_aliases=_ALIASES,
+        input_output_aliases=al,
         interpret=interpret,
         # "arbitrary": вихід colsq — накопичувач через усі плитки (на v6e одне ядро TC — втрат немає)
         **_params(("arbitrary",), interpret),
-    )(scalars, cinv, g, m, w)
+    )(*args)
     return m_new, w_new, colsq / R
 
 
-def instinct_hs1_2d(g, m, w, cs, scalars, *, interpret=False, block_rows=256):
+def instinct_hs1_2d(g, m, w, cs, scalars, *, interpret=False, block_rows=256, dst=None):
     """Крок OPT_HS_LAG для 2D-ваги (R, C). cs: f32 (1, C) — середні u1² по рядках з минулого кроку (0 — ще немає).
     scalars: f32[4] = (β, lr·eff, 1−lr·wd, насіння як біти f32). → (m_new, w_new, cs_new), m/w bf16, cs_new f32."""
     cs = cs.astype(jnp.float32)
     col = jax.lax.cond(jnp.min(cs) > 0, lambda: cs,
                        lambda: jnp.where(cs > 0, cs, _now_2d(g, m, scalars, interpret, block_rows)))
-    return _step_2d(g, m, w, col, scalars, interpret, block_rows)
+    return _step_2d(g, m, w, col, scalars, interpret, block_rows, dst=dst)
 
 
 # ------------------------------------------------------------------------------------------------- 3D (hs3)
@@ -213,32 +217,35 @@ def _now_3d(g, m, scalars, interpret, block_cols):
     return rowsq / N
 
 
-def _step_3d(g, m, w, col, scalars, interpret, block_cols):
+def _step_3d(g, m, w, col, scalars, interpret, block_cols, dst=None):
     E, K, N = g.shape
     BN = _block_cols(K, N, block_cols)
     tile = pl.BlockSpec((1, K, BN), lambda e, j: (e, 0, j))
     kspec = pl.BlockSpec((1, K, 1), lambda e, j: (e, 0, 0))
     cinv = 1.0 / (jnp.sqrt(col) + EPS)
+    kern, ins, al, args = pi._dst_call(
+        functools.partial(_hs1_cols, K=K, N=N, BN=BN), 5, [_smem_spec(interpret, 2), kspec, tile, tile, tile],
+        _ALIASES, (scalars, cinv, g, m, w), dst, tile, tile, interpret, 2)
     m_new, w_new, rowsq = pl.pallas_call(
-        functools.partial(_hs1_cols, K=K, N=N, BN=BN),
+        kern,
         out_shape=(jax.ShapeDtypeStruct((E, K, N), jnp.bfloat16), jax.ShapeDtypeStruct((E, K, N), jnp.bfloat16),
                    jax.ShapeDtypeStruct((E, K, 1), jnp.float32)),
         grid=(E, pl.cdiv(N, BN)),
-        in_specs=[_smem_spec(interpret, 2), kspec, tile, tile, tile],
+        in_specs=ins,
         out_specs=(tile, tile, kspec),
-        input_output_aliases=_ALIASES,
+        input_output_aliases=al,
         interpret=interpret,
         **_params_vmem(("parallel", "arbitrary"), interpret, _vmem_3d(K, BN)),
-    )(scalars, cinv, g, m, w)
+    )(*args)
     return m_new, w_new, rowsq / N
 
 
-def instinct_hs1_3d(g, m, w, cs, scalars, *, interpret=False, block_cols=512):
+def instinct_hs1_3d(g, m, w, cs, scalars, *, interpret=False, block_cols=512, dst=None):
     """Крок OPT_HS_LAG для експертів (E, K, N), kind "hs3". cs: f32 (E, K, 1). → (m_new, w_new, cs_new)."""
     cs = cs.astype(jnp.float32)
     col = jax.lax.cond(jnp.min(cs) > 0, lambda: cs,
                        lambda: jnp.where(cs > 0, cs, _now_3d(g, m, scalars, interpret, block_cols)))
-    return _step_3d(g, m, w, col, scalars, interpret, block_cols)
+    return _step_3d(g, m, w, col, scalars, interpret, block_cols, dst=dst)
 
 
 # ------------------------------------------------------------------------------------------------- еталон

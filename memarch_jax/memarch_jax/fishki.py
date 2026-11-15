@@ -31,15 +31,28 @@ def init(key, cfg):
     return {"norm": jnp.ones((NF, d), dt), "up": up, "down": down}
 
 
-def _one(norm, up, down, h):
+def _center(xn):
+    """fish_center (14.11, fw_s2): прибрати зі входу фішки спільний вектор потоку — каузальне середнє x̂ по
+    попередніх словах рядка (cumsum/t, без зазирання вперед). Причина: на ck34000 |mean x̂|/rms x̂ = 0.42, а стовпці
+    up усіх фішок дрейфнули проти цього вектора (a_mu = mean·up ≈ −6 при std решти 1.3) → relu² мертвий для 99.9%
+    пар нейрон×слово, градієнта немає, фішки не вчаться. Вартість O(B·T·d) проти 2·d·HF матмулу (~1e-4)."""
+    xf = xn.astype(F32)
+    t = jnp.arange(1, xf.shape[1] + 1, dtype=F32)[None, :, None]
+    return (xf - jnp.cumsum(xf, 1) / t).astype(xn.dtype)
+
+
+def _one(norm, up, down, h, center=False):
     x = h.astype(F32)
-    xn = (x * lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + 1e-6)).astype(h.dtype) * norm.astype(h.dtype)
+    xn = (x * lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + 1e-6)).astype(h.dtype)
+    if center:
+        xn = _center(xn)
+    xn = xn * norm.astype(h.dtype)
     a = jnp.einsum("btd,dh->bth", xn, up.astype(h.dtype), preferred_element_type=F32).astype(h.dtype)
     return h + jnp.einsum("bth,hd->btd", jnp.square(jax.nn.relu(a)), down.astype(h.dtype),
                           preferred_element_type=F32).astype(h.dtype)
 
 
-def chain(pf, h, order, axis=None, remat=False):
+def chain(pf, h, order, axis=None, remat=False, center=False):
     """h (B,T,d); order (C,) int — номери фішок цього кроку по черзі. axis — ім'я осі shard_map (ваги порізані по d)."""
     def step(h, i):
         up = lax.dynamic_index_in_dim(pf["up"], i, 0, keepdims=False)          # (d[/W], HF)
@@ -48,7 +61,7 @@ def chain(pf, h, order, axis=None, remat=False):
         if axis is not None:                                                   # зібрати вибрану фішку з усіх чипів
             up = lax.all_gather(up, axis, axis=0, tiled=True)
             down = lax.all_gather(down, axis, axis=0, tiled=True)
-        return _one(norm, up, down, h)
+        return _one(norm, up, down, h, center)
     if remat:
         step = jax.checkpoint(step, policy=None if remat is True else remat)
     for c in range(order.shape[0]):

@@ -43,6 +43,8 @@ def pre_attn(p, x, cfg):
     n1 = rmsnorm(x, p["n1"])
     # qkv3: три множення на зрізи однієї ваги
     q, k, v = (linear(n1, p["qkv"][i * D:(i + 1) * D]).reshape(B, T, H, hd) for i in range(3))
+    if getattr(cfg, "attn_gain", 1.0) != 1.0:               # ПРОПОЗИЦІЯ (вимкнено): гостріша увага
+        q = q * jnp.asarray(cfg.attn_gain, q.dtype)
     if ROPE_BTHD:
         q, k = rope_half(q, cfg.rope_base, t_axis=-3), rope_half(k, cfg.rope_base, t_axis=-3)
         q, k, v = (t.transpose(0, 2, 1, 3) for t in (q, k, v))
@@ -59,7 +61,10 @@ def pre_attn_rope(p, x, cfg):
     H, hd = cfg.heads, D // cfg.heads
     n1 = rmsnorm(x, p["n1"])
     qu, ku, v = (linear(n1, p["qkv"][i * D:(i + 1) * D]).reshape(B, T, H, hd).transpose(0, 2, 1, 3) for i in range(3))
-    return rope_half(qu, cfg.rope_base), rope_half(ku, cfg.rope_base), qu, ku, v
+    if getattr(cfg, "attn_gain", 1.0) != 1.0:               # ПРОПОЗИЦІЯ (вимкнено)
+        qu = qu * jnp.asarray(cfg.attn_gain, qu.dtype)
+    pc = float(getattr(cfg, "rope_pcut", 0.0))              # p-RoPE троса (0 — як було)
+    return rope_half(qu, cfg.rope_base, pcut=pc), rope_half(ku, cfg.rope_base, pcut=pc), qu, ku, v
 
 
 def post_attn(p, x, a, cfg):

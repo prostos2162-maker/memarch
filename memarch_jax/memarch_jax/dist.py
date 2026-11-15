@@ -211,8 +211,39 @@ def make_dist(cfg, W, axis=AXIS):
 def prep_keys(cfg):
     """Ключі prep; cfg.remind додає маску відповідей нагадувань \"rem\" (B,T)."""
     return (("cand", "on", "bk", "src") + (("rem",) if getattr(cfg, "remind", False) else ())
+            + (("rem_vals",) if getattr(cfg, "remind_strict", False) else ())
+            + (("rem_y",) if getattr(cfg, "remind_blank", False) else ())
             + (("hfull",) if getattr(cfg, "heavy_rotate", False) and not getattr(cfg, "heavy_all", False) else ())
             + (("fish", "kind") if getattr(cfg, "fish_n", 0) > 0 else ()))
+
+
+def rb_batch_template(cfg, consts, alt_cfg=None):
+    """15.11 відкатник А: форми збереженого на пристрої батча opt["rb_b"] = {xy, prep} (рядки всіх чипів W·B).
+    Ключі prep — об'єднання ключів обох кроків (текст / синтетика); цілі й bool зберігаються як int32."""
+    import numpy as np
+    from . import model
+    rows, T = cfg.W * cfg.B, cfg.T
+    one = model.make_prep(np.full((1, T), 5, np.int64), cfg, consts)
+    keys = list(prep_keys(cfg)) + [k for k in (prep_keys(alt_cfg) if alt_cfg is not None else ()) if k not in prep_keys(cfg)]
+    tail = dict(rem=(T,), rem_y=(T,), rem_vals=(T,), fish=(int(getattr(cfg, "fish_c", 1) or 1),), kind=(1,), hfull=(1,))
+    out = {}
+    for k in keys:
+        shp = (rows,) + (tuple(one[k].shape[1:]) if k in one else tail[k])
+        dt = jnp.float32 if (k in one and jnp.issubdtype(one[k].dtype, jnp.floating)) else jnp.int32
+        out[k] = jax.ShapeDtypeStruct(shp, dt)
+    return dict(xy=jax.ShapeDtypeStruct((rows, T + 1), jnp.int32), prep=out)
+
+
+def rb_fish_put(opt, ps, icfg, put_fn):
+    """Знімок відкатника: рядки фішок (k, ...) шардуються як сам тензор фішок (NF, ...) — інакше jit кладе їх
+    реплікованими (по 0.19 GiB на листок на кожен чип + all-gather при вирізанні)."""
+    flat = {instinct.path_str(p_): x for p_, x in jax.tree_util.tree_flatten_with_path(ps)[0]}
+    out = dict(opt)
+    for nm in ("rb_p", "rb_m"):
+        if nm in opt:
+            out[nm] = {k: (put_fn(v, flat[k].sharding) if (k in flat and instinct.rb_is_fish(k, flat[k], icfg)) else v)
+                       for k, v in opt[nm].items()}
+    return out
 
 
 def situation_local(emb_l, x, W, axis=AXIS):
@@ -242,10 +273,15 @@ def make_loss_fn(cfg, consts, mesh, params_like, remat=False):
         return total[None], tau_n, pm(terms), pm(stats), sit
 
     prep_spec = {k: P(AXIS) for k in prep_keys(cfg)}
+    dump = getattr(cfg, "norm_dump_proj", False)
+    if dump:                                            # fix14 F1: напрям U (d,) — однаковий на всіх чипах
+        prep_spec["stream_u"] = P()
     sm = _shard_map(local, mesh=mesh, in_specs=(pspecs, P(AXIS), prep_spec, P()),
                     out_specs=(P(AXIS), P(), P(), P(), P()))
 
     def loss_fn(params, xy, prep, tau):
+        if dump and "stream_u" not in prep:             # eval / без U: нулі → середнє по батчу всередині norm
+            prep = dict(prep, stream_u=jnp.zeros((params["norm"].shape[-1],), F32))
         per, tau_n, terms, stats, sit = sm(params, xy, prep, tau)
         return per.mean(), (tau_n, terms, stats, per, sit)
     return loss_fn
@@ -327,6 +363,12 @@ def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=Tru
         s = by_shape.get((x.shape, x.dtype), by_shape.get(x.shape))
         return jax.device_put(x, s) if s is not None and not x.sharding.is_equivalent_to(s, x.ndim) else x
     opt = jax.tree_util.tree_map(_fix, opt)
+    if getattr(icfg, "rollback", False):             # 15.11 відкатник А: рядки фішок знімка — тим самим розрізом, що фішки
+        opt = rb_fish_put(opt, ps, icfg, lambda x, sh: jax.device_put(x, sh))
+    if getattr(icfg, "rollback", False):             # 15.11 відкатник А: батч попереднього кроку — на пристрої, по рядках
+        _row = NamedSharding(mesh, P(AXIS))
+        opt = dict(opt, rb_b=jax.tree_util.tree_map(
+            lambda t: jax.device_put(jnp.zeros(t.shape, t.dtype), _row), rb_batch_template(cfg, consts, alt_cfg)))
     state = dict(params=ps, opt=opt, tau=jax.device_put(model.init_tau(cfg, tau), rep),
                  step=jax.device_put(jnp.zeros((), jnp.int32), rep))
     st_sh = jax.tree_util.tree_map(lambda x: x.sharding, state)
@@ -354,6 +396,7 @@ def make_step(cfg, consts, mesh, params, spec, icfg, *, remat="none", donate=Tru
     def loss_fn2(p, xy, prep, t):
         loss, (tau_n, terms, stats, per, sit) = lf2(p, xy, prep, t)
         return loss, (tau_n, terms, stats, {"situation": sit, "per_chip": per})
+    b_sh2 = dict(xy=row, prep={k: row for k in prep_keys(alt_cfg)}, lr=rep)    # етап 1 може мати свої ключі (rem_vals)
     ts2 = S.make_train_step(alt_cfg, consts, spec, icfg, remat=remat, loss_fn=loss_fn2, donate=donate, coll=coll,
-                            in_shardings=(st_sh, b_sh), out_shardings=(st_sh, rep), offload=off)
+                            in_shardings=(st_sh, b_sh2), out_shardings=(st_sh, rep), offload=off)
     return ts, state, place_batch, ts2

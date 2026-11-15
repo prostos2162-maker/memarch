@@ -45,6 +45,13 @@ def sizes(T, BQ=None, BK=None):
     """Розміри тайлів: ROPE_V3_BQ / ROPE_V3_BK (типово 1024 / 1024), обрізані до T; T має ділитися на обидва."""
     BQ = min(int(os.environ.get("ROPE_V3_BQ", 1024)) if BQ is None else BQ, T)
     BK = min(int(os.environ.get("ROPE_V3_BK", 1024)) if BK is None else BK, T)
+
+    def _fit(n, b):                    # 12.11: короткі рядки етапу 1 (1280, 2304, …) — найбільший тайл ≤ b, що ділить n
+        for c in (b, 512, 256, 128):
+            if c <= b and n % c == 0:
+                return c
+        return b
+    BQ, BK = _fit(T, BQ), _fit(T, BK)    # для T=8192 лишається 1024/1024
     assert T % BQ == 0 and T % BK == 0, (T, BQ, BK)
     return BQ, BK
 

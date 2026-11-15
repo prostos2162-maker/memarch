@@ -110,6 +110,10 @@ def _args(argv=None):
     # --- лог / eval / ckpt
     a.add_argument("--log_every", type=int, default=10)
     a.add_argument("--eval_every", type=int, default=250)
+    a.add_argument("--eval_at_resume", action="store_true",
+                   help="12.11: після resume — eval чекпойнта ДО першого кроку (у межах самого навчання; TPU лише для навчання)")
+    a.add_argument("--eval_only", action="store_true",
+                   help="12.11: лише eval відновленого ckpt (без жодного кроку тренування) і вихід")
     a.add_argument("--ckpt_every", type=int, default=500)
     a.add_argument("--ckpt_local", default="/dev/shm/memarch_ckpt", help="локальна тека ckpt (RAM: диск VM замалий; ціль Fv2moeK40 ≈45 GiB на ckpt)")
     a.add_argument("--ckpt_gcs", default=None, help="gs://... — копія кожного ckpt (у фоні) + маркер COMPLETE")
@@ -126,6 +130,20 @@ def _args(argv=None):
     a.add_argument("--fish_hf", type=int, default=19456, help="ширина фішки (2·d·hf параметрів)")
     a.add_argument("--fish_pool", type=int, default=17, help="фішок у наборі виду (готова модель)")
     a.add_argument("--fish_c", type=int, default=2, help="фішок за крок на тренуванні (випадкові з набору виду)")
+    a.add_argument("--fish_center", type=int, default=0, help="1 — вхід фішки без спільного вектора (фікс мертвих relu², fw_s2 14.11)")
+    a.add_argument("--inst_word", action="store_true",
+                   help="15.11 Instinct на словах: норма ≥0.5 — нічого; розмазано — легкий поштовх до 0.3; впевнено неправильне — обережно вниз")
+    a.add_argument("--opt_rollback", action="store_true",
+                   help="15.11 запобіжник-відкатник: loss > 1.5× звичного → ваги/інерція на стан до попереднього кроку, крок ×0.5")
+    a.add_argument("--opt_err_step", action="store_true",
+                   help="15.11 задум Стефана: крок тензора = lr·(loss/очікуване)·(звична ||g||/||g|| зараз)")
+    a.add_argument("--opt_err_cap", type=float, default=3.0, help="err_step: верхня межа множника кроку")
+    a.add_argument("--opt_gearbox", action="store_true",
+                   help="15.11 Стефан: «механіка» — у кожного тензора передача 0.25/0.5/1/1.25 за готовою інструкцією")
+    a.add_argument("--fish_reset", action="store_true",
+                   help="14.11: при resume фішки — з початкових ваг (fishki.init), їхня інерція Instinct = 0")
+    a.add_argument("--eval_nofish", action="store_true",
+                   help="14.11: eval mix ще й з обнуленими фішками (down=0) → внесок фішок = mix_nofish − mix")
     a.add_argument("--fish_full_from", type=int, default=-1, help="з цього кроку — фінальна фаза: увесь набір виду")
     a.add_argument("--heavy_full_every", type=int, default=0,
                    help="тасування (ідея Стефана 11.11): кожен K-й крок один важкий шар (по колу 0..heavy-1) працює на ВСІХ словах; 0 — вимкнено")
@@ -135,6 +153,10 @@ def _args(argv=None):
                    help="частка голок справжнього тексту У ВІКНІ (відстань 0..вікно, трос відкритий): лікує заважання троса близьким фактам")
     a.add_argument("--remind_dist", type=int, default=0, help="мін. відстань факти→питання (0 = cfg.window)")
     a.add_argument("--remind_tok0", type=int, default=1000, help="перший токен голок: ключі +0..511, значення +512..575, мітка +576")
+    a.add_argument("--remind_cand", action="store_true",
+                   help="fix19: втрата відповіді голки — softmax лише по 64 значеннях (не по всьому словнику)")
+    a.add_argument("--remind_mask_main", action="store_true",
+                   help="fix19: у рядках з голками main не вчиться на токенах голок (k0..мітка)")
     a.add_argument("--remind_w", type=float, default=1.0, help="вага доданку remind")
     a.add_argument("--remind_use_w", type=float, default=0.0,
                    help="штраф на питаннях нагадувань: w·(1 − частка уваги троса), диференційовна mass (0 — немає)")
@@ -146,9 +168,122 @@ def _args(argv=None):
                    help="етап 1 (--remind_synth) точно як torch rope_recall: КОРОТКІ рядки (факти на початку рядка, сміття, "
                         "питання; довжина 4·пар+сміття, рядків — щоб слів у батчі було B·T), рівні (пар 4→8→q, сміття "
                         "16→…) за точністю, втрата — середнє по відповідях. Крок компілюється раз на рівень")
+    a.add_argument("--remind_strict", action="store_true",
+                   help="етап 1 «чесний тест» (Стефан 12.11): після першої помилки в епізоді правильні відповіді не "
+                        "винагороджуються, а ймовірність на інших значеннях рядка штрафується завжди (проти перебору)")
+    a.add_argument("--remind_strict_w", type=float, default=1.0, help="вага штрафу --remind_strict")
+    a.add_argument("--remind_mix", default="",
+                   help="плавний перехід після етапу 1 (Стефан 12.11): частки СИНТЕТИЧНИХ кроків по фазах у %%, напр. "
+                        "90,75,50,25,5; остання лишається назавжди. Порожньо — різкий перехід, як було")
+    a.add_argument("--remind_mix_len", type=int, default=250, help="кроків на фазу --remind_mix")
+    a.add_argument("--remind_blank", action="store_true",
+                   help="етап 1 і eval pack_fN: на місці відповіді в тексті заглушка, справжня відповідь — лише ціль "
+                        "(Стефан 12.11: «відповіді бачив лише після тесту» — без цього модель викреслює вже названі)")
+    a.add_argument("--opt_gnorm", action="store_true",
+                   help="ПРОПОЗИЦІЯ (вимкнено): Instinct ділить градієнт кожної ваги на його rms перед інерцією (InstinctCfg.gnorm)")
+    a.add_argument("--opt_culprit", default="abs", choices=("abs", "ema"),
+                   help="12.11: як Instinct вибирає «винних» на поганій несподіванці: abs — найбільший |g|/|w| (як було), ema — найбільше перевищення власного середнього")
+    a.add_argument("--opt_snr", action="store_true",
+                   help="13.11 ПРОПОЗИЦІЯ: Instinct — крок тензора × впевненість c=||m||/sqrt(EMA||g||²) (шум → ~0.23, "
+                        "сталий сигнал → 1); напрям той самий. Захищає трос від випадкового блукання (InstinctCfg.snr)")
+    a.add_argument("--opt_snr_ref", type=float, default=1.0, help="c ≥ ref → повний крок (InstinctCfg.snr_ref)")
+    a.add_argument("--opt_snr_beta", type=float, default=0.95, help="EMA ||g||² (InstinctCfg.snr_beta)")
+    a.add_argument("--opt_snr_floor", type=float, default=0.1, help="найменший множник (InstinctCfg.snr_floor)")
+    a.add_argument("--opt_snr_only", default="", help="через кому префікси тензорів (напр. light_a.,light_b.); порожньо — усі, крім фішок")
+    a.add_argument("--opt_lr_mul", default="",
+                   help="14.11 fix18: множник кроку Instinct для префіксів тензорів, напр. final.qkv:0.25,final.o:0.25; порожньо — вимкнено")
+    a.add_argument("--opt_card_kind", action="store_true",
+                   help="13.11 (Стефан): картка ситуації Instinct = вид кроку фішок (+ остання — синтетика), а не схожість "
+                        "входу; при resume зі старого ckpt (4 картки) стан карток береться з ініціалізації")
+    a.add_argument("--opt_stream_proj", action="store_true",
+                   help="13.11 фікс зламу 15000 (K1): Instinct прибирає з градієнта й інерції light_a/light_b/final "
+                        "(.o/.down/.qkv) складову вздовж спільного вектора потоку перед фінальною norm (InstinctCfg.stream_proj)")
+    a.add_argument("--opt_norm_anchor", action="store_true",
+                   help="13.11 фікс зламу 15000 (K2): 1D norm-ваги light_a/light_b/final тягнуться до 1 (wd для норм)")
+    a.add_argument("--norm_dump_proj", action="store_true",
+                   help="fix14 F1 (вимкнено): фінальна norm прибирає з виходу складову вздовж EMA-напряму спільного вектора "
+                        "потоку opt.U (будь-який канал), знаменник — по повному h. Потребує --opt_stream_proj (стан U)")
+    a.add_argument("--opt_gnorm_rawrel", action="store_true",
+                   help="fix14 (вимкнено): з --opt_gnorm rel=|g|/|w| для винних/карток — від СИРОГО градієнта; при resume "
+                        "rel_avg (зіпсований ~150 після fix13) скидається")
+    a.add_argument("--opt_m_rate", action="store_true",
+                   help="fix15 (вимкнено): обмеження швидкості виходу m — U-складова кроку матриць потоку не швидше "
+                        "κ·звичайної когерентної швидкості, надлишок відкладається і віддається наступними кроками")
+    a.add_argument("--opt_m_rate_kappa", type=float, default=2.0)
+    a.add_argument("--opt_m_rate_warm", type=int, default=100)
+    a.add_argument("--opt_m_rate_gate", action="store_true",
+                   help="13.11 fix15: відкладений рух m віддається лише там, де свіжий градієнт ще згоден (інакше гаситься)")
+    a.add_argument("--opt_snr_dz", action="store_true",
+                   help="fix14 (вимкнено): з --opt_snr — dead-zone впевненості (гальмує лише блукання, сигнал — повний крок)")
+    a.add_argument("--opt_snr_horizon", type=float, default=250.0, help="горизонт H для --opt_snr_dz (кроків)")
+    a.add_argument("--data_reseed", type=int, default=-1,
+                   help="14.11 контроль: при resume документи з нового зерна (розклад видів і фішки ті самі); -1 — вимкнено")
+    a.add_argument("--opt_safe16", action="store_true",
+                   help="13.11 fix16: Instinct для light_a/light_b/final і норм — проєкція інерції проти градієнта, cautious-маска, відносний крок 1D-норм (jnp-шлях)")
+    a.add_argument("--opt_wd_norm", type=float, default=0.0,
+                   help="14.11: weight decay до 0 для 1D норм-ваг (norm, l_norm, .n1, .n2) усередині Instinct; 0 — вимкнено")
+    a.add_argument("--opt_surge_thr", type=float, default=0.0, help="fix20: −s>thr → крок ×(thr/−s)²; 0 — вимк.")
+    a.add_argument("--opt_damp", type=float, default=0.0,
+                   help="fix21: гасіння сплеску градієнта по тензору: ||g|| > k·типової → градієнт в інерцію обрізано до "
+                        "k·типової, крок ×(k·типова/||g||)^p; 0 — вимк. (легкі/фінальні/норми; стан opt.dv, opt.df)")
+    a.add_argument("--opt_damp_p", type=float, default=1.0, help="fix21: степінь скорочення кроку")
+    a.add_argument("--opt_g_max", type=float, default=3.0, help="верхня межа підсилювачів карток Instinct (було 3.0)")
+    a.add_argument("--safe_norm_ratio", type=float, default=0.0,
+                   help="13.11 fix16: після фінальної norm спільний вектор (причинний) ≤ ratio·сигнал слів; 0 — вимкнено")
+    a.add_argument("--safe_norm_t0", type=int, default=256)
+    a.add_argument("--hn_guard_w", type=float, default=0.0,
+                   help="14.11 fix17: шарнірний штраф на стовбур (|середнє hn рядка|, середня |hn| понад пороги); 0 — вимкнено")
+    a.add_argument("--hn_guard_mean", type=float, default=15.0)
+    a.add_argument("--hn_guard_len", type=float, default=42.0)
+    a.add_argument("--opt_reset_gain", action="store_true",
+                   help="12.11: після resume — підсилювачі карток Instinct (gain) = 1 (старі ckpt мали 3× на light_a/0 через abs-вибір винних)")
+    a.add_argument("--d_model", type=int, default=0,
+                   help="ПРОПОЗИЦІЯ (0 = вимкнено): ширина d для малих моделей на ПК (перевірка механізму, не повна модель)")
+    a.add_argument("--text_lr_ramp", type=int, default=0,
+                   help="ПРОПОЗИЦІЯ (0 = вимкнено): після етапу 1 крок lr на ТЕКСТОВИХ кроках росте лінійно від 0 до повного "
+                        "за стільки текстових кроків (синтетичні кроки — повний lr). Лічильник не зберігається в ckpt")
+    a.add_argument("--attn_gain", type=float, default=1.0,
+                   help="ПРОПОЗИЦІЯ (вимкнено = 1.0): множник оцінок уваги легких шарів (cfg.attn_gain)")
+    a.add_argument("--rope_pcut", type=float, default=0.0,
+                   help="ПРОПОЗИЦІЯ (0 = вимкнено): p-RoPE троса — обертаються лише частоти з хвилею ≤ N слів (напр. 256); "
+                        "решта вимірів без позиції → пригадування на небачених відстанях (d8125). Лише шар троса")
+    a.add_argument("--rope_anchor_top", action="store_true",
+                   help="ПРОПОЗИЦІЯ (вимкнено): коли слів понад поріг більше за стелю якорів, трос бере A найбільш здивованих "
+                        "по всьому рядку, а не перші A (як було: кінець рядка без якорів — свіжі факти недосяжні)")
+    a.add_argument("--rope_frac", type=float, default=0.0,
+                   help="ПРОПОЗИЦІЯ (0 = як --anchor_frac): частка якорів лише троса (густіші якорі → ланки покривають більше слів)")
+    a.add_argument("--rope_cap", type=float, default=0.0, help="стеля якорів троса (0 = як cap)")
+    a.add_argument("--rope_key_diag", action="store_true",
+                   help="13.11 (вимкнено): у журналі klink/kanch — частка слів-ключів голок у перших rope_links словах шматка "
+                        "свого якоря (їх бачить пошук) і частка ключів-якорів; на навчання не впливає")
+    a.add_argument("--remind_w_synth", type=float, default=-1.0,
+                   help="13.11 (−1 = як --remind_w): вага доданку remind лише на СИНТЕТИЧНИХ кроках (alt_cfg); "
+                        "дозволяє міняти вагу голок у тексті (--remind_w), не чіпаючи синтетичні кроки")
+    a.add_argument("--prev_in", action="store_true",
+                   help="ПРОПОЗИЦІЯ (вимкнено): вхід «попереднє слово» h[t] += σ(prev_g)·emb(x[t−1]) (cfg.prev_in; новий параметр)")
+    a.add_argument("--remind_tail", action="store_true",
+                   help="ПРОПОЗИЦІЯ (вимкнено): етап 1 — сміття між фактами й питаннями номінальне (16, 32, …), а доповнення "
+                        "рядка до --remind_pack_round іде після питань. Форма батчу, швидкість і число відповідей ті самі")
+    a.add_argument("--remind_pack_frac", default="",
+                   help="етап 1: сміття сходинок у частках вікна моделі через кому (напр. 0.125,0.25,0.5,1,1.5,2,4); "
+                        "сходинки з тією самою справжньою відстанню після --remind_pack_round не повторюються. "
+                        "Порожньо — старий фіксований список 16,32,…")
     a.add_argument("--remind_pack_round", type=int, default=1,
                    help="--remind_pack: довжина короткого рядка кратна цьому числу (ядра Pallas троса/уваги на TPU "
                         "потребують кратності блоку, напр. 256); 1 — точно як torch (4·пар + сміття − 1)")
+    a.add_argument("--remind_same_fmt", action="store_true",
+                   help="12.11: голки в справжньому тексті (і eval remind_dN/synth_dN) у ТОМУ САМОМУ форматі, що синтетика етапу 1: [k v]·n без міток, відповіді приховані (з --remind_blank)")
+    a.add_argument("--remind_far_frac", type=float, default=-1.0,
+                   help="12.11: останній рівень синтетики — частка батчів зі сміттям ЗА вікном (лише трос); −1 — рівномірно з усіх довжин (старе: 2 з 9)")
+    a.add_argument("--remind_per_row", type=int, default=1,
+                   help="13.11 (solve_curriculum): голок у КОЖНОМУ рядку тексту з голкою (різні ключі, без накладань). "
+                        "Разом із --remind 1.0 дає ~R·16 відповідей на рядок за ~R·64 слів (R=4: 3%% рядка 8192)")
+    a.add_argument("--remind_far_log", type=float, default=-1.0,
+                   help="13.11 (solve_curriculum): відстані голок у тексті — частка F за вікном, лог-рівномірно від "
+                        "--remind_dist до КІНЦЯ рядка (T−2·блок, напр. 8125); решта (1−F) — у вікні 0..вікно. −1 — як було")
+    a.add_argument("--remind_pack_level", type=int, default=-1,
+                   help="resume з ckpt без стану сходинок синтетики (старі ckpt, напр. ckpt_safe/fix_step_500): "
+                        "з якого рівня продовжити; −1 — з 0")
     a.add_argument("--remind_p0", type=float, default=None,
                    help="частка нагадувань на старті (перші --remind_warm кроків), далі лінійно за --remind_decay до --remind")
     a.add_argument("--remind_warm", type=int, default=0)
@@ -224,7 +359,8 @@ def _ckpt_dirs(root):
 
 # Прапорці, що не впливають на вчення: прогін з іншими їх значеннями — той самий прогін (той самий run_id).
 RUN_ID_SKIP = frozenset(("stop_at", "ckpt_every", "ckpt_local", "ckpt_gcs", "no_final_ckpt", "resume", "resume_force",
-                         "loss_log", "compare", "cmp_tol", "cache", "log_every", "eval_every", "eval_batches", "spike"))
+                         "loss_log", "compare", "cmp_tol", "cache", "log_every", "eval_every", "eval_batches", "spike", "eval_only", "eval_at_resume",
+                         "remind_pack_level"))
 
 
 REMIND_DEFAULTS = dict(remind=0.0, remind_q=16, remind_dist=0, remind_tok0=1000, remind_w=1.0, remind_eval="",
@@ -276,7 +412,10 @@ def local_extra(path):
         return None
 
 
-def restore_sharded(path, template):
+CARD_FIELDS = ("gain", "keys", "used", "expect", "seen", "oh")   # стан карток Instinct (розмір = кількість карток)
+
+
+def restore_sharded(path, template, reset_cards=False):
     """ckpt.save(npz) → state з ТИМИ САМИМИ шардуваннями, що й template (ckpt.restore кладе все на чип 0 —
     24B-модель туди не влазить). Листок за листком: np.load(mmap) → device_put(sharding шаблону)."""
     import numpy as np
@@ -289,13 +428,31 @@ def restore_sharded(path, template):
     tree = ckpt.state_tree(template)
     paths, vals = ckpt._flatten(tree)
     lv = meta["leaves"]
-    assert len(lv) == len(vals) and all(d["path"] == p for d, p in zip(lv, paths)), "структура ckpt ≠ стан моделі"
+    # 12.11: листки шаблону, яких немає в ckpt (нові поля стану, напр. Instinct rel_avg), лишаються з шаблону
+    idx = {json.dumps(x["path"]): i for i, x in enumerate(lv)}
+    miss = [p for p in paths if json.dumps(p) not in idx]
+    extra_ck = len(lv) - (len(paths) - len(miss))
+    assert extra_ck == 0, f"у ckpt є листки, яких немає в стані моделі ({extra_ck})"
+    if miss:
+        print(f"[train] resume: нових полів стану немає в ckpt — беру з ініціалізації: {[str(p) for p in miss]}", flush=True)
     leaves, treedef = jax.tree_util.tree_flatten(tree)
     new = []
-    for i, (d, x) in enumerate(zip(lv, leaves)):
+    for p_, x in zip(paths, leaves):
+        if json.dumps(p_) not in idx:
+            new.append(x)
+            continue
+        i = idx[json.dumps(p_)]
+        d = lv[i]
         a = np.load(os.path.join(path, "arrays", f"{i}.npy"), mmap_mode="r")
         if d["dtype"] == "bfloat16":
             a = a.view(jnp.bfloat16)
+        _key = [k[1] if isinstance(k, list) else k for k in p_]
+        if (reset_cards and len(_key) == 2 and _key[0] == "opt" and _key[1] in CARD_FIELDS
+                and list(a.shape) != list(x.shape)):
+            print(f"[train] resume: opt/{_key[1]} {list(a.shape)} → {list(x.shape)} (--opt_card_kind) — з ініціалізації",
+                  flush=True)
+            new.append(x)
+            continue
         assert list(a.shape) == list(x.shape) and str(a.dtype) == str(x.dtype), (d, x.shape, x.dtype)
         y = jax.device_put(np.array(a), x.sharding)   # np.array: 0-d лишається 0-d (ascontiguousarray робить 1-d)
         x.delete()                                         # шаблон більше не потрібен — звільняємо HBM одразу
@@ -332,11 +489,14 @@ class GcsStore:
         return sorted(int(n[5:]) for n in names if n.startswith("step_") and n[5:].isdigit())
 
     def delete_older(self, step):
+        # 15.11: лишати ще CKPT_KEEP−1 попередніх (добрий 35500 перезаписався зламаним 35750 при keep=1)
+        keep = max(int(os.environ.get("CKPT_KEEP", "3")) - 1, 0)
         ls = subprocess.run(f"gcloud storage ls {self.dst}/", shell=True, capture_output=True, text=True).stdout
-        for d in ls.split():
-            nm = d.rstrip("/").split("/")[-1]
-            if nm.startswith("step_") and nm[5:].isdigit() and int(nm[5:]) < step:
-                subprocess.run(f"gcloud storage rm -r -q {d}", shell=True)
+        old = sorted((int(d.rstrip("/").split("/")[-1][5:]), d) for d in ls.split()
+                     if d.rstrip("/").split("/")[-1].startswith("step_") and d.rstrip("/").split("/")[-1][5:].isdigit()
+                     and int(d.rstrip("/").split("/")[-1][5:]) < step)
+        for _, d in (old[:len(old) - keep] if keep else old):
+            subprocess.run(f"gcloud storage rm -r -q {d}", shell=True)
 
     def fetch(self, step, dst):
         subprocess.run(f"gcloud storage rsync -r -q {self.dst}/step_{step} {dst}", shell=True, check=True)
@@ -384,9 +544,12 @@ class FileStore(GcsStore):
                       and os.path.exists(os.path.join(self.root, n, "COMPLETE")))
 
     def delete_older(self, step):
-        for n in os.listdir(self.root):
-            if n.startswith("step_") and n[5:].isdigit() and int(n[5:]) < step:
-                shutil.rmtree(os.path.join(self.root, n), ignore_errors=True)
+        # 15.11: лишати ще CKPT_KEEP−1 попередніх (добрий 35500 перезаписався зламаним 35750 при keep=1)
+        keep = max(int(os.environ.get("CKPT_KEEP", "3")) - 1, 0)
+        old = sorted(int(n[5:]) for n in os.listdir(self.root) if n.startswith("step_") and n[5:].isdigit()
+                     and int(n[5:]) < step)
+        for st in old[:len(old) - keep] if keep else old:
+            shutil.rmtree(os.path.join(self.root, f"step_{st}"), ignore_errors=True)
 
     def fetch(self, step, dst):
         shutil.copytree(self._d(step), dst, dirs_exist_ok=True)
@@ -556,6 +719,69 @@ def _num(x):
         return "?"
 
 
+def _snr_str(mm, spec):
+    """--opt_snr: множник впевненості кроку для тензорів троса і середній (для журналу)."""
+    import numpy as np
+    if "snr_f" not in mm:
+        return ""
+    f = np.asarray(mm["snr_f"], np.float64).ravel()
+    names = [e[0] for e in spec]
+    pick = [("tros.qkv", "light_b.0.qkv"), ("tros.o", "light_b.0.o"), ("vhid.qkv", "light_a.0.qkv"), ("emb", "emb"), ("head", "head")]
+    parts = [f"{lab} {f[names.index(n)]:.2f}" for lab, n in pick if n in names and names.index(n) < f.size]
+    dmp = ""
+    if "df" in mm:                                                      # fix21: найсильніше загальмований тензор кроку
+        d = np.asarray(mm["df"], np.float64).ravel()
+        j = int(d.argmin())
+        dmp = f" | damp min {d[j]:.2f} {names[j] if j < len(names) else j} n<1 {int((d < 1).sum())}"
+    return f" | snr сер {f.mean():.2f} " + " ".join(parts) + dmp
+
+
+def _gain_str(mm, spec):
+    """13.11: підсилювачі картки кроку (top-3 і фінальні шари) + top-3 rel (|крок|/|w|) — щоб бачити «запинку»."""
+    import numpy as np
+    if "g" not in mm:
+        return ""
+    names = [e[0] for e in spec]
+    g = np.asarray(mm["g"], np.float64).ravel()
+    out = " | g " + " ".join(f"{names[i]} {g[i]:.2f}" for i in np.argsort(-g)[:3] if i < len(names))
+    fin = [i for i, n in enumerate(names) if n.startswith("final.") and i < g.size]
+    if fin:
+        out += f" fin max {g[fin].max():.2f}"
+    if "rel" in mm:
+        r = np.asarray(mm["rel"], np.float64).ravel()
+        out += " | rel " + " ".join(f"{names[i]} {r[i]:.4f}" for i in np.argsort(-r)[:3] if i < len(names))
+    if "mrl_bank" in mm:                                                 # fix15: |банк| відкладеного руху m, обрізаних тензорів
+        out += f" | mrl bank {float(np.ravel(mm['mrl_bank'])[0]):.3g} cut {float(np.ravel(mm['mrl_cut'])[0]):.0f}" + (f" drop {float(np.ravel(mm['mrl_drop'])[0]):.3g}" if "mrl_drop" in mm else "")
+    return out
+
+
+def _rowsum_ratio(m):
+    """|Σ рядків| / Σ|рядок| таблиці (V, C): для градієнта/інерції softmax-голови ≡ 0 (Σ_i (p_i − y_i) = 0)."""
+    import jax.numpy as jnp
+    m = m.astype(jnp.float32)
+    return jnp.linalg.norm(m.sum(0)) / (jnp.sqrt((m * m).sum(1)).sum() + 1e-30)
+
+
+def _nullspace(st):
+    """16.11 (fable52g): здоров'я нуль-простору softmax голів — друкується з кожним eval. Причина зламів 15000 і 34014+:
+    градієнт голови переставав бути градієнтом softmax (Σp ≠ 1 через неузгоджене округлення логітів, ce.CE_LOGITS) і
+    розганяв спільний зсув логітів. Знаки (за чекпойнтами): сума рядків інерції l_head1 0.0005 (30000, здорово) →
+    0.12 (34000) → 0.99 (35250); head 0.21 (15000) → 0.35 (15250), здорово 0.0002; l_head0 σ1/σ2 1.05 → 1.83 → 4.3."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    out = []
+    m = st.get("opt", {}).get("m", {}) if isinstance(st, dict) else {}
+    for k in ("l_head1", "head"):
+        if k in m:
+            out.append(f"сума рядків інерції {k} {float(jax.jit(_rowsum_ratio)(m[k])):.4f}")
+    pr = st.get("params", {}) if isinstance(st, dict) else {}
+    if "l_head0" in pr:
+        sv = np.linalg.svd(np.asarray(pr["l_head0"].astype(jnp.float32)), compute_uv=False)
+        out.append(f"l_head0 σ1/σ2 {sv[0]:.2f}/{sv[1]:.2f} = {sv[0] / max(sv[1], 1e-9):.2f}")
+    return " | ".join(out) + " (softmax ⇒ суми ≈ 0; > 0.05 або σ1/σ2 > 1.5 — тривога)"
+
+
 def main(argv=None):
     args = _args(argv)
     if args.cpu8:
@@ -592,7 +818,8 @@ def main(argv=None):
         fish_kinds = {k: {s: _wf[s] for s in srcs if s in _wf} for k, srcs in FISH_KINDS.items()}
         fish_kinds = {k: v for k, v in fish_kinds.items() if v}
         cfg = dataclasses.replace(cfg, fish_n=args.fish_n, fish_hf=args.fish_hf, fish_pool=args.fish_pool,
-                                  fish_c=args.fish_c, fish_kinds=len(fish_kinds))
+                                  fish_c=args.fish_c, fish_kinds=len(fish_kinds),
+                                  fish_center=bool(args.fish_center))
     if getattr(args, "heavy_all", False):
         cfg = dataclasses.replace(cfg, heavy_all=True)
     elif getattr(args, "heavy_full_every", 0) > 0:
@@ -602,7 +829,21 @@ def main(argv=None):
     rem_on = args.remind > 0
     if rem_on:
         cfg = dataclasses.replace(cfg, remind=True, remind_w=args.remind_w, remind_q=args.remind_q,
-                                  remind_use_w=args.remind_use_w)
+                                  remind_use_w=args.remind_use_w, remind_blank=bool(args.remind_blank),
+                                  remind_tok0=int(args.remind_tok0),
+                                  remind_cand=bool(getattr(args, "remind_cand", False)),
+                                  remind_mask_main=bool(getattr(args, "remind_mask_main", False)))
+    if getattr(args, "d_model", 0) > 0:
+        cfg = dataclasses.replace(cfg, d=int(args.d_model))
+    if getattr(args, "attn_gain", 1.0) != 1.0 or getattr(args, "prev_in", False):
+        cfg = dataclasses.replace(cfg, attn_gain=float(args.attn_gain), prev_in=bool(args.prev_in))
+    cfg = dataclasses.replace(cfg, rope_pcut=float(getattr(args, "rope_pcut", 0.0)),
+                              rope_anchor_top=bool(getattr(args, "rope_anchor_top", False)),
+                              rope_frac=float(getattr(args, "rope_frac", 0.0)), rope_cap=float(getattr(args, "rope_cap", 0.0)),
+                              rope_key_diag=bool(getattr(args, "rope_key_diag", False)))
+    if cfg.rope_anchor_top or cfg.rope_pcut > 0 or cfg.rope_frac > 0 or cfg.rope_cap > 0 or cfg.rope_key_diag:
+        P(f"трос (13.11): anchor_top={cfg.rope_anchor_top} pcut={cfg.rope_pcut} rope_frac={cfg.rope_frac or cfg.frac} "
+          f"rope_cap={cfg.rope_cap or cfg.cap} key_diag={cfg.rope_key_diag}")
     mesh = dist.make_mesh(W)
     tok_step = W * cfg.B * cfg.T
     stop = min(args.stop_at or args.steps, args.steps)
@@ -617,11 +858,102 @@ def main(argv=None):
     remat = tuple({"True": True, "False": False}.get(x, x)
                   for x in args.remat.split(",")) if "," in args.remat else args.remat
     model.remat_parts(remat)
-    use_pallas = plat == "tpu" and not args.no_pallas and cfg.dtype == "bf16"
+    # PALLAS_CPU=1 — лише для перевірок на ПК: ядра Instinct у режимі interpret (та сама математика)
+    use_pallas = (plat == "tpu" or os.environ.get("PALLAS_CPU") == "1") and not args.no_pallas and cfg.dtype == "bf16"
     icfg = instinct.InstinctCfg(lr_peak=args.lr, use_pallas=use_pallas, sr=cfg.dtype == "bf16",
                                 m_bf16=cfg.dtype == "bf16")
     if args.opt_scale is not None:
         icfg = dataclasses.replace(icfg, scale=args.opt_scale)
+    if getattr(args, "opt_gnorm", False):
+        icfg = dataclasses.replace(icfg, gnorm=True)
+    if getattr(args, "opt_snr", False):
+        icfg = dataclasses.replace(icfg, snr=True, snr_ref=args.opt_snr_ref, snr_beta=args.opt_snr_beta,
+                                   snr_floor=args.opt_snr_floor,
+                                   snr_only=tuple(x for x in args.opt_snr_only.split(",") if x))
+        P(f"Instinct: впевненість кроку (--opt_snr) ref {args.opt_snr_ref} beta {args.opt_snr_beta} floor {args.opt_snr_floor}")
+    if getattr(args, "opt_lr_mul", ""):                                    # fix18
+        _lm = tuple((x.split(":")[0], float(x.split(":")[1])) for x in args.opt_lr_mul.split(",") if x)
+        icfg = dataclasses.replace(icfg, lr_mul=_lm)
+        P(f"fix18: множник кроку Instinct {_lm}")
+    if getattr(args, "opt_card_kind", False):
+        if not fish_kinds:
+            raise SystemExit("--opt_card_kind потребує фішок (видів кроку)")
+        icfg = dataclasses.replace(icfg, card_by_kind=True, cards=len(fish_kinds) + 1)
+        P(f"Instinct: картка = вид кроку ({list(fish_kinds)} + синтетика = {icfg.cards} карток)")
+    if getattr(args, "opt_stream_proj", False):
+        icfg = dataclasses.replace(icfg, stream_proj=True)
+        cfg = dataclasses.replace(cfg, stream_m=True)
+        P("Instinct: K1 — без складової вздовж спільного вектора потоку (--opt_stream_proj)")
+    if getattr(args, "norm_dump_proj", False):
+        if not getattr(args, "opt_stream_proj", False):
+            raise SystemExit("--norm_dump_proj потребує --opt_stream_proj (EMA-напрям U у стані Instinct)")
+        cfg = dataclasses.replace(cfg, norm_dump_proj=True, stream_m=True)
+        P("fix14 F1: фінальна norm без складової вздовж U (--norm_dump_proj)")
+    if getattr(args, "opt_m_rate", False):
+        icfg = dataclasses.replace(icfg, m_rate=True, m_rate_kappa=args.opt_m_rate_kappa, m_rate_warm=args.opt_m_rate_warm)
+        cfg = dataclasses.replace(cfg, stream_m=True)
+        P(f"fix15: швидкість виходу m обмежена (--opt_m_rate) κ {args.opt_m_rate_kappa} розігрів {args.opt_m_rate_warm}")
+        if getattr(args, "opt_m_rate_gate", False):
+            icfg = dataclasses.replace(icfg, m_rate_gate=True)
+            P("fix15: відкладений рух m — лише де свіжий градієнт згоден (--opt_m_rate_gate)")
+    if getattr(args, "opt_gnorm_rawrel", False):
+        icfg = dataclasses.replace(icfg, gnorm_rawrel=True)
+        P("fix14: rel/винні від сирого градієнта при gnorm (--opt_gnorm_rawrel)")
+    if getattr(args, "opt_snr_dz", False):
+        if not getattr(args, "opt_snr", False):
+            raise SystemExit("--opt_snr_dz потребує --opt_snr")
+        icfg = dataclasses.replace(icfg, snr_dz=True, snr_horizon=args.opt_snr_horizon)
+        P(f"fix14: dead-zone впевненості (--opt_snr_dz) H {args.opt_snr_horizon}")
+    if getattr(args, "opt_norm_anchor", False):
+        icfg = dataclasses.replace(icfg, norm_anchor=True)
+        P("Instinct: K2 — 1D norm-ваги light/final тягнуться до 1 (--opt_norm_anchor)")
+    if getattr(args, "opt_safe16", False):
+        icfg = dataclasses.replace(icfg, safe16=True)
+        P("fix16: Instinct — проєкція інерції проти градієнта + cautious + відносний крок норм (light_a/light_b/final/norm)")
+    if getattr(args, "opt_wd_norm", 0.0) > 0:
+        icfg = dataclasses.replace(icfg, wd_norm=float(args.opt_wd_norm))
+        P(f"Instinct: weight decay до 0 для 1D норм-ваг = {args.opt_wd_norm} (--opt_wd_norm)")
+    if getattr(args, "opt_surge_thr", 0.0) > 0:                             # fix20
+        icfg = dataclasses.replace(icfg, surge_thr=float(args.opt_surge_thr))
+        P(f"fix20: гальмо несподіванки thr {args.opt_surge_thr}")
+    if getattr(args, "opt_damp", 0.0) > 0:                                  # fix21
+        icfg = dataclasses.replace(icfg, damp=float(args.opt_damp), damp_p=float(args.opt_damp_p))
+        P(f"fix21: гасіння сплеску градієнта по тензору: поріг {args.opt_damp}× типової норми, степінь {args.opt_damp_p}")
+    if getattr(args, "inst_word", False):                                     # 15.11 Instinct на словах
+        cfg = dataclasses.replace(cfg, inst_word=True, iw_rewrite=True, iw_random=False)
+        P(f"inst_word: переписана відповідь — норма ≥0.5 нічого; поза нормою: правильному +δ' (δ={cfg.iw_delta}), "
+          f"top-{cfg.iw_k} конкурентам −δ'·p_i/Σp (δ'=min(δ,Σp), Σq=1)")
+    if getattr(args, "opt_rollback", False):                                  # 15.11 запобіжник-відкатник
+        _fn = int(getattr(cfg, "fish_n", 0) or 0)
+        _fk = int(getattr(args, "fish_c", 2) or 2) if _fn > 0 else 0
+        icfg = dataclasses.replace(icfg, rollback=True, rb_fish_n=_fn, rb_fish_k=_fk)
+        if os.environ.get("RB_TEST_SPIKE"):                                   # перевірка: відкатник без розігріву
+            icfg = dataclasses.replace(icfg, rb_warm=3)
+        P(f"відкатник: копія лише ствола + {_fk} активних фішок з {_fn}")
+        P(f"відкатник: loss > {icfg.rb_ratio}× звичного → відкат на стан до попереднього кроку, крок ×{icfg.rb_lr}")
+    if getattr(args, "opt_err_step", False):                                  # 15.11 задум Стефана
+        icfg = dataclasses.replace(icfg, err_step=True, damp=max(float(getattr(args, "opt_damp", 0.0)), 2.0),
+                                   err_cap=float(getattr(args, "opt_err_cap", 3.0)))
+        P(f"err_step: крок = lr·(похибка/очікувана)·(звична ||g||/||g||), ≤ {icfg.err_cap} (задум Стефана, 15.11)")
+    if getattr(args, "opt_gearbox", False):                                   # 15.11 «механіка» Стефана
+        icfg = dataclasses.replace(icfg, gearbox=True, err_step=False,
+                                   damp=max(float(getattr(args, "opt_damp", 0.0)), 2.0))
+        P(f"коробка передач: {instinct.GEARS}, передачі лише по одній: вниз при ||g||>{icfg.gb_down}× звичної, "
+          f"вгору коли спокійно (<{icfg.gb_up}×) і розігнався до поточної; множник кроку плавно ≤{icfg.gb_acc} за крок; "
+          f"камера: понад 1.0 і loss гірший за очікуваний → штраф, вниз; нуля (зчеплення) немає")
+    if getattr(args, "opt_g_max", 3.0) != 3.0:
+        icfg = dataclasses.replace(icfg, g_max=float(args.opt_g_max))
+        P(f"fix16: підсилювачі карток ≤ {args.opt_g_max}")
+    if getattr(args, "hn_guard_w", 0.0) > 0:
+        cfg = dataclasses.replace(cfg, hn_guard_w=float(args.hn_guard_w), hn_guard_mean=float(args.hn_guard_mean),
+                                  hn_guard_len=float(args.hn_guard_len))
+        P(f"fix17: штраф стовбура w {args.hn_guard_w}: |сер. hn| > {args.hn_guard_mean}, |hn| > {args.hn_guard_len}")
+    if getattr(args, "safe_norm_ratio", 0.0) > 0:
+        cfg = dataclasses.replace(cfg, safe_norm_ratio=float(args.safe_norm_ratio), safe_norm_t0=int(args.safe_norm_t0))
+        P(f"fix16: спільний вектор після фінальної norm ≤ {args.safe_norm_ratio}·сигнал (причинно, з позиції {args.safe_norm_t0})")
+    if getattr(args, "opt_culprit", "abs") != "abs":
+        icfg = dataclasses.replace(icfg, culprit=args.opt_culprit)
+        P(f"Instinct: винні на поганій несподіванці — {args.opt_culprit} (перевищення власного середнього rel)")
     P(f"Instinct: scale={icfg.scale} wd={icfg.weight_decay} beta={icfg.beta} pallas={use_pallas}; "
       f"rope={cfg.rope} read={cfg.rope_read} pallas={cfg.rope_pallas} route={cfg.rope_route} layers={cfg.rope_layers} "
       f"frac={cfg.frac} cap={cfg.cap}")
@@ -643,15 +975,25 @@ def main(argv=None):
     if rem_on and args.remind_synth > 0:
         ts, state, place, ts_synth = dist.make_step(cfg, consts, mesh, params, spec, icfg, remat=remat,
                                                     alt_cfg=dataclasses.replace(cfg, remind_only=True,
-                                                                                remind_mean=bool(args.remind_pack)))
+                                                                                remind_w=(args.remind_w_synth if args.remind_w_synth >= 0
+                                                                                          else cfg.remind_w),
+                                                                                remind_mean=bool(args.remind_pack),
+                                                                                remind_strict=bool(args.remind_strict
+                                                                                                   and args.remind_pack),
+                                                                                remind_strict_w=args.remind_strict_w))
     else:
         ts, state, place = dist.make_step(cfg, consts, mesh, params, spec, icfg, remat=remat)
     if diag.ON:
         jax.block_until_ready(state)
         diag.phase("стан Instinct і крок готові (make_step)")
     # eval: лише fwd (та сама shard_map-втрата; tau/стан не змінюються)
-    lf = dist.make_loss_fn(dataclasses.replace(cfg, fish_eval=True) if getattr(cfg, "fish_n", 0) > 0 else cfg,
-                           consts, mesh, params, remat)
+    # 12.11: без фінальної фази (--fish_full_from < 0) eval іде тим самим числом фішок, що й тренування (fish_c);
+    # раніше рядок ішов через увесь набір (17 фішок ланцюжком) — конфігурацію, якої модель ніколи не тренувала
+    _ec = cfg.fish_c if getattr(cfg, "fish_n", 0) > 0 and args.fish_full_from < 0 else 0
+    lf = dist.make_loss_fn(dataclasses.replace(cfg, fish_eval=True, fish_eval_c=_ec) if getattr(cfg, "fish_n", 0) > 0
+                           else cfg, consts, mesh, params, remat)
+    if getattr(cfg, "fish_n", 0) > 0:
+        P(f"eval фішок: {'по ' + str(_ec) + ' фішки виду (як тренування)' if _ec else 'увесь набір виду (готова модель)'}")
     del params
     if rem_on:                                                          # та сама одна eval-програма + лічильники голок
         eval_fn = jax.jit(lambda p, xy, prep, tau: (lambda o: (o[1]["main"], o[2]["remind_hit"], o[2]["remind_n"],
@@ -695,7 +1037,8 @@ def main(argv=None):
     if fish_kinds:
         from . import fishki as _fk
         corpus = data.KindCorpus(fish_kinds, _fk.pools(cfg), cfg.fish_c, root=args.data_root, seq=cfg.T, seed=args.seed,
-                                 rank=rank, world=world, cache=args.cache, eos=eos)
+                                 rank=rank, world=world, cache=args.cache, eos=eos,
+                                 doc_seed=(args.data_reseed if getattr(args, "data_reseed", -1) >= 0 else None))
         P(f"фішки: {cfg.fish_n} × {2 * cfg.d * cfg.fish_hf / 1e9:.3f}B, видів {cfg.fish_kinds} {list(fish_kinds)}, "
           f"набір {cfg.fish_pool}, за крок {cfg.fish_c}, фінальна фаза з кроку {args.fish_full_from}")
     else:
@@ -725,14 +1068,24 @@ def main(argv=None):
                                pack=args.remind_pack and args.remind_synth > 0,
                                pack_round=args.remind_pack_round, pack_mult=W,
                                doc_eos=getattr(cfg, "rope_doc_eos", -1),
-                               near=args.remind_near, near_max=max(0, _w - _L))
+                               near=args.remind_near, near_max=max(0, _w - _L),
+                               strict=bool(args.remind_strict and args.remind_pack),
+                               pack_frac=[float(v) for v in args.remind_pack_frac.split(",")] if args.remind_pack_frac
+                               else None, win_ref=_w, blank=bool(args.remind_blank),
+                               tail=bool(getattr(args, "remind_tail", False)))
+        if args.remind_mix:
+            rem_x.mix_fracs = [float(v) / 100.0 for v in args.remind_mix.split(",")]
+            rem_x.mix_len = int(args.remind_mix_len)
+            P(f"нагадування: плавний перехід після кроку {args.remind_synth}: синтетичних кроків "
+              f"{args.remind_mix}% по {args.remind_mix_len} кр., далі {args.remind_mix.split(',')[-1]}% назавжди")
         if args.remind_p0 is not None or lad:
             P(f"нагадування: розклад p {args.remind_p0} ({args.remind_warm} кр.) → {args.remind} за {args.remind_decay}; "
               f"штраф троса {args.remind_use_w}; драбина {lad} поріг {args.remind_thr} вікно {args.remind_win} відповідей")
         P(f"нагадування: p={args.remind} пар {args.remind_q} відстань ≥{rem_x.dist} токени {rem_x.k0}..{rem_x.mark} "
-          f"вага {args.remind_w}")
+          f"вага {args.remind_w}" + (f" (синтетичні кроки {args.remind_w_synth})" if args.remind_w_synth >= 0 else ""))
         _pf = prep_fn
-        prep_fn = lambda x: dict(_pf(x), rem=np.zeros(x.shape, np.int8))    # eval-набори без голок: маска нулі
+        prep_fn = lambda x: dict(_pf(x), rem=np.zeros(x.shape, np.int8),    # eval-набори без голок: маска нулі
+                                 **({"rem_y": np.zeros(x.shape, np.int32)} if args.remind_blank else {}))
         mx = cfg.T + 1 - 2 * rem_x.L
         rem_dists = ([int(v) for v in args.remind_eval.split(",")] if args.remind_eval else
                      sorted({min(v, mx) for v in (_w // 2, dmin, 2 * _w, 4 * _w, mx)}))
@@ -741,12 +1094,31 @@ def main(argv=None):
         if rem_x.pack:
             P(f"синтетика короткими рядками (--remind_pack): рівні (пар, сміття) {rem_x.plevels}; eval pack_fN: {args.remind_q} пар, "
               f"сміття {rem_x.pfill}")
+            P("  справжнє сміття сходинок (після округлення до {}; вікно {}): {}".format(
+                rem_x.pack_round, _w, [(pp, rem_x.real_fill(pp, f), f"{rem_x.real_fill(pp, f) / _w:.0%}")
+                                       for pp, f in rem_x.plevels]))
+    if rem_x is not None and getattr(args, "remind_same_fmt", False):
+        rem_x.same_fmt = True
+        P("нагадування: голки в тексті — той самий формат, що синтетика етапу 1"
+          + (" (відповіді приховані)" if rem_x.blank else ""))
+    if rem_x is not None and (getattr(args, "remind_per_row", 1) > 1 or getattr(args, "remind_far_log", -1.0) >= 0):
+        assert rem_x.same_fmt, "--remind_per_row/--remind_far_log потребують --remind_same_fmt"
+        rem_x.per_row = max(1, int(args.remind_per_row))
+        rem_x.far_log = float(args.remind_far_log) if args.remind_far_log >= 0 else 1.0 - rem_x.near
+        P(f"нагадування: у рядку тексту {rem_x.per_row} голок; {rem_x.far_log:.0%} за вікном (лог-рівномірно "
+          f"{rem_x.dist}..{cfg.T + 1 - 2 * 2 * rem_x.n}), решта у вікні 0..{rem_x.near_max}")
+    if rem_x is not None and getattr(args, "remind_far_frac", -1.0) >= 0:
+        rem_x.far_frac, rem_x.far_win = float(args.remind_far_frac), int(cfg.window)
+        P(f"нагадування: останній рівень — {rem_x.far_frac:.0%} батчів зі сміттям за вікном {cfg.window} (лише трос)")
     hl = data.HostLoader(corpus, rows, prep_fn=_pf if rem_on else prep_fn, depth=3, xform=rem_x)
     P(f"корпус: {len(weights)} джерел, eos={eos}, rank {rank}/{world}, суміш "
       + " ".join(f"{k}={v:g}" for k, v in weights.items()))
 
+    _rb_test = int(os.environ.get("RB_TEST_SPIKE", "0"))   # 15.11: перевірка відкатника — lr ×300 на одному кроці
+
     def lr_of(i):
-        return instinct.lr_at(i, args.lr, args.steps, warmup=args.warmup, sched=args.sched)
+        _l = instinct.lr_at(i, args.lr, args.steps, warmup=args.warmup, sched=args.sched)
+        return _l * float(os.environ.get("RB_TEST_MUL", "300")) if (_rb_test and i == _rb_test) else _l
 
     rot = bool(getattr(cfg, "heavy_rotate", False)) and not getattr(cfg, "heavy_all", False)
 
@@ -805,6 +1177,15 @@ def main(argv=None):
                     hits.append((float(hh), float(nn), float(nl)))
                 v.append(float(r))
             out[nm] = float(np.mean(v))
+            if nm == "mix" and getattr(args, "eval_nofish", False) and "fish" in st["params"]:   # 14.11: внесок фішок
+                _pz = dict(st["params"]); _fz = dict(_pz["fish"]); _fz["down"] = jnp.zeros_like(_fz["down"]); _pz["fish"] = _fz
+                _w = []
+                for xy, prep in bs:
+                    b = mk(xy, prep, 0.0)
+                    r = eval_fn(_pz, b["xy"], b["prep"], st["tau"])
+                    _w.append(float(r[0] if rem_on else r))
+                out["mix_nofish"] = float(np.mean(_w))
+                out["fish_gain"] = out["mix_nofish"] - out[nm]
             if nm.startswith(("remind_d", "synth_d", "pack_f")):                               # точність = p(значення)>0.5; nll на відповідь
                 den = max(sum(h[1] for h in hits), 1e-9)
                 out[nm + "_acc"] = sum(h[0] for h in hits) / den
@@ -851,6 +1232,10 @@ def main(argv=None):
                     f"сміття {ff}: {out[f'pack_f{ff}_acc']:.1%}" + (f" (nomem {out[f'pack_f{ff}_acc_nomem']:.1%})"
                                                                    if f"pack_f{ff}_acc_nomem" in out else "")
                     for ff in rem_x.pfill))
+        try:                                                    # 16.11 (fable52g): ранній знак зламу голів, див. _nullspace
+            P(f"NULLSPACE step {i}: " + _nullspace(st))
+        except Exception as e:                                  # діагностика не має права зупиняти тренування
+            P(f"NULLSPACE step {i}: не пораховано ({type(e).__name__}: {str(e)[:160]})")
         return out
 
     # --- resume
@@ -891,11 +1276,62 @@ def main(argv=None):
             P("resume: ckpt немає — старт з нуля")
         else:
             t0 = time.perf_counter()
-            state, ds, extra = restore_sharded(path, state)
-            if rem_x is not None and rem_x.ladder and isinstance(ds, dict) and "_remind" in ds:
+            state, ds, extra = restore_sharded(path, state, reset_cards=getattr(args, "opt_card_kind", False))
+            # 12.11: і для --remind_pack (сходинки синтетики) — раніше лише при ladder, тож після resume сходинки
+            # починались з рівня 0
+            if rem_x is not None and (rem_x.ladder or rem_x.pack) and isinstance(ds, dict) and "_remind" in ds:
                 rem_x.load(ds["_remind"])
-                P(f"resume нагадувань: рівні {rem_x.changes}")
+                P(f"resume нагадувань: рівні {rem_x.changes}"
+                  + (f", сходинки синтетики {rem_x.pchanges}" if rem_x.pack else ""))
+            elif rem_x is not None and rem_x.pack and getattr(args, "remind_pack_level", -1) >= 0:
+                _pl = min(int(args.remind_pack_level), len(rem_x.plevels) - 1)
+                rem_x.pchanges = [(0, _pl)]
+                P(f"resume нагадувань: стану сходинок у ckpt немає → --remind_pack_level {_pl} "
+                  f"{rem_x.plevels[_pl]}")
+            elif rem_x is not None and rem_x.pack:
+                P("УВАГА: у ckpt немає стану сходинок синтетики — почнуться з рівня 0 "
+                  "(задай --remind_pack_level, щоб продовжити з потрібного)")
+            if getattr(args, "data_reseed", -1) >= 0 and isinstance(ds, dict) and "subs" in ds:
+                ds = dict(ds, subs=None)
+                P(f"resume: дані з нового зерна {args.data_reseed} (--data_reseed): розклад видів той самий, документи інші")
             hl.load_state_dict(ds)
+            if getattr(args, "opt_reset_gain", False) and "opt" in state and "gain" in state["opt"]:
+                _g = state["opt"]["gain"]
+                state = dict(state, opt=dict(state["opt"], gain=jax.device_put(jnp.ones(_g.shape, _g.dtype), _g.sharding)))
+                P("resume: підсилювачі карток Instinct скинуто до 1 (--opt_reset_gain)")
+            # 15.11 (fable52f): OPT_RESET_EXPECT=1 — для resume з ckpt, записаного кодом з ІНШИМ складом втрати (напр.
+            # step_34250 від main5_1115_1900: старий доданок iw ≈ −1.8 → expect і rb_lema занижені; main5_1115_2013 після
+            # такого resume: s<0 щокроку і 17 відкатів за 130 кроків). Скидає очікування карток і звичну втрату
+            # відкатника: перший крок кожної картки задає рівень заново. Для чистого step_34000 НЕ потрібно.
+            if os.environ.get("OPT_RESET_EXPECT") and "opt" in state:
+                _o = dict(state["opt"])
+                for _k in ("expect", "seen", "rb_lema"):
+                    if _k in _o:
+                        _o[_k] = jax.device_put(jnp.zeros(_o[_k].shape, _o[_k].dtype), _o[_k].sharding)
+                for _k in ("rb_cool", "rb_valid", "rb_rep"):
+                    if _k in _o:
+                        _o[_k] = jax.device_put(jnp.zeros(_o[_k].shape, bool), _o[_k].sharding)
+                state = dict(state, opt=_o)
+                P("resume: очікування карток і звичну втрату відкатника скинуто (OPT_RESET_EXPECT)")
+            if getattr(args, "opt_gnorm_rawrel", False) and "opt" in state and "rel_avg" in state["opt"]:
+                _r = state["opt"]["rel_avg"]
+                state = dict(state, opt=dict(state["opt"], rel_avg=jax.device_put(jnp.zeros(_r.shape, _r.dtype), _r.sharding)))
+                P("resume: rel_avg Instinct скинуто (--opt_gnorm_rawrel)")
+            if getattr(args, "fish_reset", False) and "fish" in state["params"]:
+                from . import fishki as _fk
+                _fp = state["params"]["fish"]
+                _sh = {k: v.sharding for k, v in _fp.items()}
+                _new = jax.jit(lambda k: _fk.init(k, cfg), out_shardings=_sh)(jax.random.PRNGKey(args.seed + 1414))
+                _par = dict(state["params"]); _par["fish"] = _new
+                _opt = dict(state["opt"])
+                for _key in ("m", "cs"):                                 # плоскі словники name → масив (instinct.init)
+                    if isinstance(_opt.get(_key), dict):
+                        _d = dict(_opt[_key]); _z = [n for n in _d if str(n).startswith("fish")]
+                        for n in _z: _d[n] = jnp.zeros_like(_d[n])
+                        _opt[_key] = _d
+                        if _z: P(f"resume: стан Instinct фішок обнулено ({_key}: {_z})")
+                state = dict(state, params=_par, opt=_opt)
+                P("resume: фішки з початкових ваг (--fish_reset)")
             i0 = int(np.asarray(jax.device_get(state["step"])))
             P(f"resume з {path}: step {i0}, tau {float(np.ravel(state['tau'])[0]):.4f} ({time.perf_counter() - t0:.1f} с)")
 
@@ -913,40 +1349,62 @@ def main(argv=None):
         if tree is None:
             tree = ckpt.snapshot(st)
         ds = hl.state_dict()
-        if rem_x is not None and rem_x.ladder:
+        if rem_x is not None and (rem_x.ladder or rem_x.pack):
             ds = dict(ds, _remind=rem_x.state())
         saver.submit(tree, i, ds, dict(args=vars(args), mix=weights, run_id=rid))
         P(f"ckpt step {i}: цикл стояв {time.perf_counter() - t0:.2f} с (знімок на хост)")
 
+    if getattr(args, "eval_at_resume", False) and i0 > 0 and not getattr(args, "eval_only", False):
+        P(f"eval чекпойнта step {i0} перед навчанням (--eval_at_resume)")
+        run_eval(state, i0)
+    if getattr(args, "eval_only", False):                                # 12.11: правильний eval старого ckpt
+        P(f"eval_only: ckpt step {i0}, без тренування")
+        run_eval(state, i0)
+        P("RESULT " + json.dumps(dict(status="EVAL_ONLY", step=i0)))
+        hl.close()
+        return True
     # --- цикл
     lossf = open(args.loss_log, "a") if args.loss_log else None
     times, ema, n_comp0 = [], None, len(compiles)
     win_t, win_tok, win_wait, win_n = 0.0, 0, 0.0, 0
+    syn_far, syn_near = [0.0, 0.0], [0.0, 0.0]                         # синтетика: влучання/відповіді за вікном і у вікні
     first_ms = None
     nan_at = int(os.environ.get("TRAIN_NAN_AT", "0"))
     i = i0
     status = "OK"
+    _n_text = 0
     while i < stop:
         tw = time.perf_counter()
         if fish_kinds and args.fish_full_from >= 0 and i == args.fish_full_from and not corpus.full:
             corpus.full = True                                           # фінальна фаза: увесь набір виду
             P(f"step {i}: фішки — фінальна фаза (увесь набір виду, {cfg.fish_pool} фішок)")
         xy, prep = hl.next()
-        batch = mk(xy, prep, lr_of(i), hfull_of(i))
+        is_syn = ts_synth is not None and rem_x is not None and rem_x.synth_at(i)
+        _lr = lr_of(i)
+        if getattr(args, "text_lr_ramp", 0) > 0 and ts_synth is not None and not is_syn:
+            _n_text += 1                                                # ПРОПОЗИЦІЯ: м'який вхід тексту після етапу 1
+            _lr = _lr * min(1.0, _n_text / args.text_lr_ramp)
+        batch = mk(xy, prep, _lr, hfull_of(i))
         t_wait = time.perf_counter() - tw
         t0 = time.perf_counter()
-        if ts_synth is not None and i < args.remind_synth:              # етап 1 (batch i — синтетика, див. Reminders)
+        if is_syn:                                                      # етап 1 / синтетичний крок плавного переходу
             state, m = ts_synth(state, batch)
         else:
             if ts_synth is not None and i == args.remind_synth:
-                P(f"step {i}: етап 1 (синтетика) завершено → звичайний текст з нагадуваннями")
+                P(f"step {i}: етап 1 (синтетика) завершено → текст з нагадуваннями"
+                  + (f"; плавний перехід --remind_mix {args.remind_mix} по {args.remind_mix_len} кр." if rem_x.mix_fracs
+                     else ""))
             state, m = ts(state, batch)
         if rem_x is not None and (rem_x.ladder or rem_x.pack):          # та сама синхронізація + 2 скаляри
             loss, rh, rn = (float(v) for v in jax.device_get((m["loss"], m["stats"]["remind_hit"],
                                                                 m["stats"]["remind_n"])))
-            if rem_x.pack and i < args.remind_synth:                    # короткі рядки: відповідей у батчі — з маски
+            if rem_x.pack and is_syn:                                   # короткі рядки: відповідей у батчі — з маски
                 _na = float(np.asarray(prep["rem"]).sum())
                 msg = rem_x.observe(i, rh / max(rn, 1e-9) * _na, _na)
+                _pp, _fr = rem_x.pack_fill_at(i)                        # відстань питання→ключ ≥ сміття+2
+                _acc = syn_far if _fr + 2 > cfg.window else syn_near
+                _acc[0] += rh / max(rn, 1e-9) * _na
+                _acc[1] += _na
             else:
                 msg = rem_x.observe(i, rh * W * cfg.B * cfg.remind_q, rn * W * cfg.B * cfg.remind_q)
             if msg:
@@ -990,10 +1448,15 @@ def main(argv=None):
             hp = (f" uroboros corr {float(sts['uroboros_corr']):.3f} eaten {float(sts['uroboros_eaten']):.3f} "
                   f"sel {float(sts['uroboros_nll_sel']):.3f} skip {float(sts['uroboros_nll_skip']):.3f}"
                   if "uroboros_corr" in sts else (f" anch {float(sts['anchors']):.3f}" if "anchors" in sts else ""))
+            if "hn_mean" in sts:                                        # fix17: дрейф стовбура після фінальної norm
+                hp += (f" | hn mean {float(sts['hn_mean']):.1f} len {float(sts['hn_len']):.1f}"
+                       + (f" guard {float(tr['hn_guard']):.4f}" if "hn_guard" in tr else ""))
             if "rope_share" in sts:                                     # вагонетка: частка уваги, якорі, втрачені слова
                 ov = float(sts.get("rope_overflow", 0.0))
                 hp += (f" | rope share {float(sts['rope_share']):.4f} anch {float(sts['rope_anchors']):.4f} "
-                       f"overflow {ov:.5f}")
+                       f"overflow {ov:.5f}"
+                       + (f" klink {float(sts['rope_key_link']):.3f} kanch {float(sts['rope_key_anch']):.3f}"
+                          if "rope_key_link" in sts else ""))
                 if ov > 0:
                     P(f"УВАГА step {i}: вагонетка губить слова — rope_overflow {ov:.5f} "
                       f"(зібраних слів понад --rope_gather_cap); підніми --rope_gather_cap")
@@ -1005,7 +1468,25 @@ def main(argv=None):
                        + f"p {rem_x.p_at(i - 1):.3f}" + (f" рівень {rem_x.level_at(i - 1)} {rem_x.range_at(i - 1)}"
                                                        if rem_x.ladder else "")
                        + (f" синт.рівень {rem_x.plevel_at(i - 1)}/{len(rem_x.plevels) - 1} "
-                          f"{rem_x.plevels[rem_x.plevel_at(i - 1)]}" if rem_x.pack and i <= args.remind_synth else ""))
+                          f"{rem_x.plevels[rem_x.plevel_at(i - 1)]}" if rem_x.pack and (i <= args.remind_synth or is_syn)
+                          else ""))
+            if "iw_ok_frac" in sts:                                    # 15.11 Instinct на словах
+                hp += (f" | слова: норма {float(sts['iw_ok_frac']):.3f} розмаз {float(sts['iw_spread_frac']):.3f} "
+                       f"впевн.хибно {float(sts['iw_cw_frac']):.3f}")
+            if "rb_n" in mm:                                           # 15.11 відкатник
+                hp += f" | відкатів {int(np.asarray(mm['rb_n']))}"
+            if "remind_main_masked" in sts:                            # fix19: частка слів, вилучених з main
+                hp += f" | main-маска голок {float(sts['remind_main_masked']):.4f}"
+            if syn_far[1] + syn_near[1] > 0:                           # 12.11: синтетика з останнього журналу — окремо
+                hp += (" | синт. за вікном " + (f"{syn_far[0] / syn_far[1]:.3f} ({syn_far[1]:.0f})" if syn_far[1] else "—")
+                       + " у вікні " + (f"{syn_near[0] / syn_near[1]:.3f} ({syn_near[1]:.0f})" if syn_near[1] else "—"))
+                syn_far[:], syn_near[:] = [0.0, 0.0], [0.0, 0.0]
+            if "remind_hit_q1" in sts:                                 # етап 1: точність по питаннях 1..4 рядка
+                hp += " | q1..4 " + " ".join(
+                    f"{float(sts[f'remind_hit_q{qk}']) / max(float(sts[f'remind_n_q{qk}']), 1e-9):.3f}" for qk in range(1, 5))
+            if "remind_strict_keep" in sts:
+                hp += (f" | strict keep {float(sts['remind_strict_keep']):.3f} pen {float(sts['remind_strict_pen']):.3f} "
+                       f"P(інші) {float(sts['remind_strict_pother']):.3f} rare_drop {float(sts['remind_strict_rare_drop']):.3f}")
             moe_l = ""
             if "moe_active_l" in sts:                                   # MOE_LAYER_STATS=1: живих експертів по шарах
                 ac = np.ravel(np.asarray(sts["moe_active_l"]))
@@ -1020,7 +1501,7 @@ def main(argv=None):
               f"tau {float(np.ravel(mm['tau'])[0]):.4f}{hp} | moe fill {float(sts.get('moe_fill', np.nan)):.3f} "
               f"drop {float(sts.get('moe_drop', np.nan)):.4f}{moe_l} chip loss {pc.min():.3f}..{pc.max():.3f} "
               f"| |w| {float(pnorm_fn(state['params'])):.1f} k {_num(mm['k'])} s {_num(mm['s'])} "
-              f"stake {_num(mm['stake'])} | {el / 60:.1f} хв, ETA {eta / 60:.1f} хв "
+              f"stake {_num(mm['stake'])}{_snr_str(mm, spec)}{_gain_str(mm, spec)} | {el / 60:.1f} хв, ETA {eta / 60:.1f} хв "
               f"| рекомп кроку {_recomp(ts)}")
             win_t, win_tok, win_wait, win_n = 0.0, 0, 0.0, 0
         if args.eval_every and i % args.eval_every == 0:

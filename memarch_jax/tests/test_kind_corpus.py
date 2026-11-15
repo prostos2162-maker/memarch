@@ -14,7 +14,7 @@ KINDS = {"code": {"stack_v3": 0.4}, "math": {"nemotron_math4": 0.15}, "uk": {"hp
          "en": {"fineweb_edu": 0.2}}
 POOLS = [[0, 1, 2, 3, 4], [4, 5, 6, 7, 8], [8, 9, 10, 11, 0], [11, 12, 13, 14, 15]]
 mk = lambda rank: data.KindCorpus(KINDS, POOLS, 2, root=ROOT, seq=256, seed=3, rank=rank, world=2, eos=131072,
-                                   cache=r"D:\ai\memarch\_tmp\kc_cache")
+                                   cache=r"<local path>")
 a, b = mk(0), mk(1)
 ks, orders = [], []
 for i in range(40):

@@ -25,9 +25,9 @@ CFG = config.small(d=128, head_dim=64, E=16, V=V, short_v=256, ce_chunk=512, T=T
 
 CALLS = []
 _orig = instinct._pallas_call
-def _spy(kfn, args, sc, it, shard, leaf, li):
+def _spy(kfn, args, sc, it, shard, leaf, li, **kw):
     CALLS.append((leaf, shard is not None and shard[1].get(leaf) is not None and any(a for a in shard[1][leaf])))
-    return _orig(kfn, args, sc, it, shard, leaf, li)
+    return _orig(kfn, args, sc, it, shard, leaf, li, **kw)
 instinct._pallas_call = _spy
 
 

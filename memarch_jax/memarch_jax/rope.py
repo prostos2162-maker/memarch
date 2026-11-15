@@ -37,11 +37,19 @@ class RopeCfg:
     mgrad: bool = False                # mass диференційовна (штраф --remind_use_w); False — під stop_gradient, як було
 
 
-def anchors_from_surprise(s, tau, A):
-    """s: (B, T) f32, s[:, 0] вже 1e4. Повертає own (B, T), apos (B, A), avalid (B, A)."""
+def anchors_from_surprise(s, tau, A, top=False):
+    """s: (B, T) f32, s[:, 0] вже 1e4. Повертає own (B, T), apos (B, A), avalid (B, A).
+    Коли слів понад поріг більше за стелю A: top=False — лишаються ПЕРШІ A за порядком (як було: хвіст рядка
+    без якорів, тобто найсвіжіші факти недосяжні); top=True — A найбільш здивованих (якорі по всьому рядку).
+    Поки стеля не досягнута, обидва режими дають те саме."""
     B, T = s.shape
     anchor = (s > tau).at[:, 0].set(True)
-    keep = anchor & (jnp.cumsum(anchor.astype(jnp.int32), axis=1) <= A)
+    if top and A < T:
+        _, ti = lax.top_k(jnp.where(anchor, s, -jnp.inf), A)
+        sel = jnp.zeros((B, T), bool).at[jnp.arange(B)[:, None], ti].set(True)
+        keep = anchor & sel
+    else:
+        keep = anchor & (jnp.cumsum(anchor.astype(jnp.int32), axis=1) <= A)
     own = jnp.cumsum(keep.astype(jnp.int32), axis=1) - 1
     pos = jnp.arange(T, dtype=jnp.int32)[None, :]
     key = (~keep).astype(jnp.int32) * T + pos
